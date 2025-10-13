@@ -39,6 +39,8 @@ typedef struct {
    } recQ[ARRAY_SIZE];
 } RWS_info; 
 
+static int 
+
 
 
 /* Function declarations */
@@ -143,132 +145,84 @@ int input_transfer(client_res_info response_info, char *buf, int acknum) {
 }
 
 
-void handle_get(client_res_info response_info, char *buf, int ack_num) {
-    if (buf == NULL) return;
-    buf += 4; // skip "get "
-    buf[strcspn(buf, "\r\n ")] = '\0'; 
-    printf("Requested file: %s\n", buf);
-    
-    FILE *file_ptr = fopen(buf, "rb");
+void get_handler(char *buf, ssize_t buf_len, server_res_info server_info) {
+    if (!buf || buf_len <= 0) return;
 
-    if (!file_ptr) {
-        printf("FILE WAS NOT FOUND\n"); 
-        sender(response_info, "File not found", NULL, ack_num); 
-        perror("File not found");
+    // Find first '|' (end of header section)
+    char *sep = memchr(buf, '|', buf_len);
+    if (!sep) {
+        fprintf(stderr, "Invalid packet (missing '|')\n");
         return;
     }
 
-    // char *ack_msg = strcspn("touchfile:", buf);
-    sender(response_info, buf, NULL, ack_num); 
-    fseek(file_ptr, 0, SEEK_END);
-    long file_size = ftell(file_ptr);
-    fseek(file_ptr, 0, SEEK_SET);
+    // Extract filename
+    char filename[256];
+    memset(filename, 0, sizeof(filename));
 
-    printf("Sending file: %s (%ld bytes)\n", buf, file_size);
-
-    char file_buffer[BUFSIZE];
-    char ack_buffer[BUFSIZE];
-    char last_buffer[BUFSIZE];
-    size_t bytes_read;
-    int frame_num = 0;
-
-    struct timeval tv;
-    tv.tv_sec = 1;   // timeout in seconds
-    tv.tv_usec = 0;  // microseconds
-    setsockopt(response_info.sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    while ((bytes_read = fread(file_buffer, 1, BUFSIZE - 100, file_ptr)) > 0) {
-        int n = recvfrom(
-            response_info.sockfd, 
-            ack_buffer, 
-            sizeof(ack_buffer), 
-            0,
-            (struct sockaddr *) &response_info.clientaddr, 
-            (socklen_t *) &response_info.clientlen
-        );
-        if (n < 0) {
-            if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                printf("Timeout waiting for ACK\n");
-                // resend last packet
-                if (frame_num > 0) { 
-                    printf("Resending frame %d\n", frame_num - 1);
-                    int resend_n = sendto(
-                        response_info.sockfd, 
-                        last_buffer, 
-                        strlen(last_buffer), 
-                        0, 
-                        (struct sockaddr *) &response_info.clientaddr, 
-                        response_info.clientlen
-                    );
-                    if (resend_n < 0) {
-                        perror("Resend failed");
-                    }
-
-                }
-            } else {
-                perror("recvfrom");
-                fclose(file_ptr);
-            }
-        }
-        else if (n > 0) { 
-            // Null-terminate the received buffer for safe printing
-            if (n < BUFSIZE) ack_buffer[n] = '\0';
-            
-            if (strncasecmp(ack_buffer, "GOTIT(CLIENT):", 14) == 0) {
-                printf("Received ACK from client: %s\n", ack_buffer);
-            }
-            else { 
-                printf("Received unexpected message: %s\n", ack_buffer);
-                continue; 
-            }
-        }
-
-
-
-        char packet[BUFSIZE];
-        
-        // Build the header: "putfile:filename | "
-        int header_len = snprintf(packet, sizeof(packet), "putfile:%s|", buf);
-        
-        // CRITICAL: Don't use snprintf for the data part - it stops at null bytes!
-        // Just copy the binary data directly after the header
-        memcpy(packet + header_len, file_buffer, bytes_read);
-        int total_len = header_len + bytes_read;
-
-        // Save last buffer for potential resend
-        memcpy(last_buffer, packet, total_len);
-
-        // Send the complete packet with actual byte count
-        n = sendto(
-            response_info.sockfd, 
-            packet, 
-            total_len,  // Use actual length, not strlen()
-            0, 
-            (struct sockaddr *) &response_info.clientaddr, 
-            response_info.clientlen
-        );
-
-        if (n < 0) {
-            perror("sendto failed");
-            break;
-        }
-
-        printf("Sent frame %d (%zu bytes data + %d bytes header = %d total)\n", 
-               frame_num, bytes_read, header_len, total_len);
-        frame_num++;
-
-        // Small delay to avoid overwhelming the receiver (optional)
-        // usleep(1000); // 1ms delay
+    char *prefix = strstr(buf, "putfile:");
+    size_t name_len = 0;
+    if (prefix) {
+        // between "putfile:" and first '|'
+        name_len = sep - (prefix + 8);
+        if (name_len >= sizeof(filename)) name_len = sizeof(filename) - 1;
+        memcpy(filename, prefix + 8, name_len);
+    } else {
+        // no "putfile:" prefix, assume filename starts at beginning
+        name_len = sep - buf;
+        if (name_len >= sizeof(filename)) name_len = sizeof(filename) - 1;
+        memcpy(filename, buf, name_len);
     }
 
-    fclose(file_ptr);
+    // Trim trailing spaces
+    char *end = filename + strlen(filename) - 1;
+    while (end > filename && isspace((unsigned char)*end)) *end-- = '\0';
 
-    // Send end-of-file marker
-    // char end_msg[64];
-    // snprintf(end_msg, sizeof(end_msg), "%d|END", ack_num);
-    // sender(response_info, end_msg, NULL, ack_num); 
+    // Extract frame number (after "frame:")
+    int frame_num = -1;
+    char *frame_ptr = strstr(buf, "frame:");
+    if (frame_ptr) {
+        frame_num = atoi(frame_ptr + 6);  // skip "frame:"
+    } else {
+        fprintf(stderr, "Warning: frame number missing in packet for %s\n", filename);
+    }
 
-    printf("File transfer complete: %d frames sent\n", frame_num);
+    if (fre)
+
+    // Send ACK back to client
+    char ack_msg[128];
+    snprintf(ack_msg, sizeof(ack_msg), "ACK:%s|frame:%d", filename, frame_num);
+
+    ssize_t n = sendto(
+        server_info.sockfd,
+        ack_msg,
+        strlen(ack_msg),
+        0,
+        (struct sockaddr *)&server_info.serveraddr,
+        server_info.serverlen
+    );
+
+    if (n < 0) perror("Failed to send ACK");
+    else printf("[ACK SENT] %s (frame %d)\n", filename, frame_num);
+
+    // Get file data (everything after the *second* '|')
+    char *data_start = strstr(sep + 1, "|");
+    if (!data_start) {
+        fprintf(stderr, "Invalid packet (missing data separator '|')\n");
+        return;
+    }
+    data_start++; // skip past second '|'
+
+    size_t data_len = buf + buf_len - data_start;
+    printf("[WRITE] %zu bytes to %s (frame %d)\n", data_len, filename, frame_num);
+
+    FILE *fp = fopen(filename, "ab");
+    if (!fp) {
+        perror("fopen");
+        return;
+    }
+
+    fwrite(data_start, 1, data_len, fp);
+    fclose(fp);
 }
 
 

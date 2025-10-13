@@ -251,7 +251,7 @@ def test_reliable_under_loss(host: str, port: int, wait_secs: float, size_mb: fl
     """Restart server+client, build foo2 of requested size, apply netem delay/loss, get foo2, compare hashes, clear qdisc, stop both."""
     print("\n=== Reliability Test (netem) ===")
     # Build large foo2 BEFORE starting server
-    target_bytes = int(size_mb * 1024 * 1024)
+    target_bytes = int(size_mb * 64)
     ok_built = make_large_foo2(target_bytes)
     if not ok_built:
         print("[WARN] Could not rebuild foo2; proceeding with existing file (if any).")

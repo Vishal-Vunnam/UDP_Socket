@@ -59,6 +59,7 @@ void init_SWS(SWS_info *sender_window, int frame_size) {
 
 
 void get_handler(char *buf, ssize_t buf_len, server_res_info server_info) {
+    int frame_num = 0; 
     if (!buf || buf_len <= 0) return;
 
     // Find the first '|' in the buffer
@@ -71,6 +72,8 @@ void get_handler(char *buf, ssize_t buf_len, server_res_info server_info) {
     // Extract filename
     char filename[256];
     memset(filename, 0, sizeof(filename));
+
+    
 
     char *prefix = strstr(buf, "putfile:");
     size_t header_len = sep - buf + 1; // include '|'
@@ -88,6 +91,14 @@ void get_handler(char *buf, ssize_t buf_len, server_res_info server_info) {
     char *end = filename + strlen(filename) - 1;
     while (end > filename && isspace((unsigned char)*end)) *end-- = '\0';
 
+    // Find filename and frame number
+    char *frame_ptr = strstr(buf, "frame:");
+    int frame_num = -1;
+    if (frame_ptr) {
+        frame_num = atoi(frame_ptr + 6); // after "frame:"
+    }
+
+
     // Send ACK immediately
     char ack_msg[64];
     snprintf(ack_msg, sizeof(ack_msg), "GOTIT(CLIENT):%s", filename);
@@ -101,6 +112,8 @@ void get_handler(char *buf, ssize_t buf_len, server_res_info server_info) {
     );
     if (n < 0) perror("Failed to send ACK");
     else printf("Sent ACK for putfile:%s\n", filename);
+
+    frame_num++; 
 
     // File data is everything after the header
     char *filedata = sep + 1;
