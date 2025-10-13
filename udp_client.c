@@ -56,52 +56,65 @@ void init_SWS(SWS_info *sender_window, int frame_size) {
   }
 }
 
-
+static int expected_frame;
 
 void get_handler(char *buf, ssize_t buf_len, server_res_info server_info) {
-    int frame_num = 0; 
     if (!buf || buf_len <= 0) return;
 
-    // Find the first '|' in the buffer
-    char *sep = memchr(buf, '|', buf_len);
-    if (!sep) {
-        fprintf(stderr, "Invalid packet (missing '|')\n");
+    // Find first '|' (end of filename)
+    char *sep1 = memchr(buf, '|', buf_len);
+    if (!sep1) {
+        fprintf(stderr, "Invalid packet (missing first '|')\n");
         return;
     }
 
-    // Extract filename
+    // Find second '|' (end of frame header)
+    char *sep2 = memchr(sep1 + 1, '|', buf_len - (sep1 + 1 - buf));
+    if (!sep2) {
+        fprintf(stderr, "Invalid packet (missing second '|')\n");
+        return;
+    }
+
+    // Extract filename safely
     char filename[256];
     memset(filename, 0, sizeof(filename));
 
-    
-
     char *prefix = strstr(buf, "putfile:");
-    size_t header_len = sep - buf + 1; // include '|'
     if (prefix) {
-        size_t name_len = sep - (prefix + 8); // skip "putfile:"
+        size_t name_len = sep1 - (prefix + 8); // skip "putfile:"
         if (name_len >= sizeof(filename)) name_len = sizeof(filename) - 1;
         memcpy(filename, prefix + 8, name_len);
     } else {
-        size_t name_len = sep - buf;
+        size_t name_len = sep1 - buf;
         if (name_len >= sizeof(filename)) name_len = sizeof(filename) - 1;
         memcpy(filename, buf, name_len);
     }
 
-    // Trim whitespace
+    // Trim trailing whitespace
     char *end = filename + strlen(filename) - 1;
     while (end > filename && isspace((unsigned char)*end)) *end-- = '\0';
 
-    // Find filename and frame number
-    char *frame_ptr = strstr(buf, "frame:");
+    // Extract frame number between sep1 and sep2
     int frame_num = -1;
-    if (frame_ptr) {
-        frame_num = atoi(frame_ptr + 6); // after "frame:"
+    char frame_header[64];
+    size_t frame_len = sep2 - (sep1 + 1);
+    if (frame_len > 0 && frame_len < sizeof(frame_header)) {
+        memcpy(frame_header, sep1 + 1, frame_len);
+        frame_header[frame_len] = '\0';
+        if (strncmp(frame_header, "frame:", 6) == 0) {
+            frame_num = atoi(frame_header + 6);
+        }
     }
 
+    // Ignore out-of-order or duplicate frames
+    if (frame_num != expected_frame) {
+        printf("Ignoring out-of-order frame %d (expected %d)\n", frame_num, expected_frame);
+        return;
+    }
 
     // Send ACK immediately
     char ack_msg[64];
-    snprintf(ack_msg, sizeof(ack_msg), "GOTIT(CLIENT):%s", filename);
+    snprintf(ack_msg, sizeof(ack_msg), "GOTIT(CLIENT):frame:%d", frame_num);
     ssize_t n = sendto(
         server_info.sockfd,
         ack_msg,
@@ -110,14 +123,17 @@ void get_handler(char *buf, ssize_t buf_len, server_res_info server_info) {
         (struct sockaddr *)&server_info.serveraddr,
         server_info.serverlen
     );
-    if (n < 0) perror("Failed to send ACK");
-    else printf("Sent ACK for putfile:%s\n", filename);
+    if (n < 0)
+        perror("Failed to send ACK");
+    else
+        printf("Sent ACK for frame %d (%s)\n", frame_num, filename);
 
-    frame_num++; 
+    // Increment expected frame for next one
+    expected_frame++;
 
-    // File data is everything after the header
-    char *filedata = sep + 1;
-    size_t data_len = buf_len - header_len;
+    // File data starts right after sep2
+    char *filedata = sep2 + 1;
+    size_t data_len = buf_len - (filedata - buf);
 
     printf("Appending %zu bytes to file: %s\n", data_len, filename);
 
