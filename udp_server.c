@@ -14,6 +14,7 @@
 #include <arpa/inet.h>
 #include <dirent.h> // for handle_ls
 #include <ctype.h>
+#include <errno.h>
 
 #define BUFSIZE 1024
 #define RWS 4
@@ -25,28 +26,6 @@ typedef struct {
     int clientlen;
 } client_res_info;
 
-typedef struct { 
-    int LAR; 
-    int LFS; 
-    int frame_ptr; 
-    int frame_size; 
-    struct sendQ_data_slot { 
-        char msg[BUFSIZE]; 
-        int acked; 
-        time_t send_time; 
-    } sendQ[ARRAY_SIZE]; 
-} SWS_file_info; 
-
-typedef struct {
-   int LFR; 
-   int LAF; 
-   int frame_ptr; 
-   int frame_size;  
-   struct recQ_data_slot {
-    int received; 
-    char msg[BUFSIZE];
-   } recQ[ARRAY_SIZE];
-} RWS_file_info; 
 
 
 typedef struct {
@@ -91,27 +70,7 @@ void init_RWS(RWS_info *receiver_window, int frame_size) {
     } 
 }
 
-void init_put_RWS(RWS_file_info *receiver_window, int frame_size) { 
-    receiver_window->LFR = -1; 
-    receiver_window->LAF = -1;
-    receiver_window->frame_ptr = 0; 
-    receiver_window->frame_size = frame_size; 
-    for (int i = 0; i < ARRAY_SIZE; i++) { 
-        receiver_window->recQ[i].received = 0; 
-        memset(receiver_window->recQ[i].msg, 0, BUFSIZE);
-    } 
-}
 
-void init_get_SWS(SWS_file_info *sender_window, int frame_size) { 
-    sender_window -> LAR = -1; 
-    sender_window -> LFS = -1; 
-    sender_window -> frame_ptr = 0; 
-    sender_window -> frame_size = frame_size; 
-    for (int i = 0; i < ARRAY_SIZE; i++) { 
-        sender_window -> sendQ[i].acked = 1; 
-        memset(sender_window->sendQ[i].msg, 0, BUFSIZE);
-    }
-}
 
 int window_handler(int ack_num, RWS_info *receiver_window) { 
     if(ack_num == (receiver_window->LFR + 1) % ARRAY_SIZE) { 
@@ -208,10 +167,64 @@ void handle_get(client_res_info response_info, char *buf, int ack_num) {
     printf("Sending file: %s (%ld bytes)\n", buf, file_size);
 
     char file_buffer[BUFSIZE];
+    char ack_buffer[BUFSIZE];
+    char last_buffer[BUFSIZE];
     size_t bytes_read;
     int frame_num = 0;
 
+    struct timeval tv;
+    tv.tv_sec = 1;   // timeout in seconds
+    tv.tv_usec = 0;  // microseconds
+    setsockopt(response_info.sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     while ((bytes_read = fread(file_buffer, 1, BUFSIZE - 100, file_ptr)) > 0) {
+        int n = recvfrom(
+            response_info.sockfd, 
+            ack_buffer, 
+            sizeof(ack_buffer), 
+            0,
+            (struct sockaddr *) &response_info.clientaddr, 
+            (socklen_t *) &response_info.clientlen
+        );
+        if (n < 0) {
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                printf("Timeout waiting for ACK\n");
+                // resend last packet
+                if (frame_num > 0) { 
+                    printf("Resending frame %d\n", frame_num - 1);
+                    int resend_n = sendto(
+                        response_info.sockfd, 
+                        last_buffer, 
+                        strlen(last_buffer), 
+                        0, 
+                        (struct sockaddr *) &response_info.clientaddr, 
+                        response_info.clientlen
+                    );
+                    if (resend_n < 0) {
+                        perror("Resend failed");
+                    }
+
+                }
+            } else {
+                perror("recvfrom");
+                fclose(file_ptr);
+            }
+        }
+        else if (n > 0) { 
+            // Null-terminate the received buffer for safe printing
+            if (n < BUFSIZE) ack_buffer[n] = '\0';
+            
+            if (strncasecmp(ack_buffer, "GOTIT(CLIENT):", 14) == 0) {
+                printf("Received ACK from client: %s\n", ack_buffer);
+            }
+            else { 
+                printf("Received unexpected message: %s\n", ack_buffer);
+                continue; 
+            }
+        }
+
+
+
         char packet[BUFSIZE];
         
         // Build the header: "putfile:filename | "
@@ -222,8 +235,11 @@ void handle_get(client_res_info response_info, char *buf, int ack_num) {
         memcpy(packet + header_len, file_buffer, bytes_read);
         int total_len = header_len + bytes_read;
 
+        // Save last buffer for potential resend
+        memcpy(last_buffer, packet, total_len);
+
         // Send the complete packet with actual byte count
-        int n = sendto(
+        n = sendto(
             response_info.sockfd, 
             packet, 
             total_len,  // Use actual length, not strlen()
@@ -242,7 +258,7 @@ void handle_get(client_res_info response_info, char *buf, int ack_num) {
         frame_num++;
 
         // Small delay to avoid overwhelming the receiver (optional)
-        usleep(1000); // 1ms delay
+        // usleep(1000); // 1ms delay
     }
 
     fclose(file_ptr);
@@ -307,6 +323,23 @@ void put_helper(char *buf, int buf_len, client_res_info response_info) {
     // Trim trailing spaces from filename
     char *end = filename + strlen(filename) - 1;
     while (end > filename && isspace((unsigned char)*end)) *end-- = '\0';
+
+    char ack_msg[64]; 
+    snprintf(ack_msg, sizeof(ack_msg), "GOTIT(SERVER):%s", filename);
+    int n = sendto(
+        response_info.sockfd,
+        ack_msg,
+        strlen(ack_msg),
+        0,
+        (struct sockaddr *)&response_info.clientaddr,
+        response_info.clientlen
+    );
+    if (n < 0) { 
+        perror("Failed to send ACK"); 
+        return; 
+    }
+    else printf("Send ACK for putfile:%s\n", filename); 
+
 
     // Move sep past '|' to get payload
     sep++;

@@ -12,6 +12,7 @@
 #include <netdb.h> 
 #include <time.h>
 #include <ctype.h>
+#include <errno.h>
 
 #define BUFSIZE 1024
 #define SWS 4
@@ -37,28 +38,6 @@ typedef struct {
    } sendQ[ARRAY_SIZE];
 } SWS_info; 
 
-typedef struct { 
-    int LAR; 
-    int LFS; 
-    int frame_ptr; 
-    int frame_size; 
-    struct sendQ_data_slot { 
-        char msg[BUFSIZE]; 
-        int acked; 
-        time_t send_time; 
-    } sendQ[ARRAY_SIZE]; 
-} SWS_file_info; 
-
-typedef struct {
-   int LFR; 
-   int LAF; 
-   int frame_ptr; 
-   int frame_size;  
-   struct recQ_data_slot {
-    int received; 
-    char msg[BUFSIZE];
-   } recQ[ARRAY_SIZE];
-} RWS_file_info; 
 
 typedef struct { 
     int sockfd; 
@@ -79,34 +58,55 @@ void init_SWS(SWS_info *sender_window, int frame_size) {
 
 
 
-void get_handler(char *buf, int buf_len) {
-    if (!buf) return;
+void get_handler(char *buf, ssize_t buf_len, server_res_info server_info) {
+    if (!buf || buf_len <= 0) return;
 
-    // Find the separator
-    char *sep = strstr(buf, "|");
+    // Find the first '|' in the buffer
+    char *sep = memchr(buf, '|', buf_len);
     if (!sep) {
-        fprintf(stderr, "Invalid format (missing '|'): %s\n", buf);
+        fprintf(stderr, "Invalid packet (missing '|')\n");
         return;
     }
 
-    // Extract filename (before '|')
-    *sep = '\0';  
-    char *filename = buf;
-    char *filedata = sep + 1;
+    // Extract filename
+    char filename[256];
+    memset(filename, 0, sizeof(filename));
 
-    // Skip "putfile:" prefix if present
-    if (strncmp(filename, "putfile:", 8) == 0)
-        filename += 8;
+    char *prefix = strstr(buf, "putfile:");
+    size_t header_len = sep - buf + 1; // include '|'
+    if (prefix) {
+        size_t name_len = sep - (prefix + 8); // skip "putfile:"
+        if (name_len >= sizeof(filename)) name_len = sizeof(filename) - 1;
+        memcpy(filename, prefix + 8, name_len);
+    } else {
+        size_t name_len = sep - buf;
+        if (name_len >= sizeof(filename)) name_len = sizeof(filename) - 1;
+        memcpy(filename, buf, name_len);
+    }
 
-    // Trim filename only
-    while (isspace((unsigned char)*filename)) filename++;
+    // Trim whitespace
     char *end = filename + strlen(filename) - 1;
     while (end > filename && isspace((unsigned char)*end)) *end-- = '\0';
 
-    // Skip ONE leading space after '|' if present
-    if (*filedata == ' ') filedata++;
+    // Send ACK immediately
+    char ack_msg[64];
+    snprintf(ack_msg, sizeof(ack_msg), "GOTIT(CLIENT):%s", filename);
+    ssize_t n = sendto(
+        server_info.sockfd,
+        ack_msg,
+        strlen(ack_msg),
+        0,
+        (struct sockaddr *)&server_info.serveraddr,
+        server_info.serverlen
+    );
+    if (n < 0) perror("Failed to send ACK");
+    else printf("Sent ACK for putfile:%s\n", filename);
 
-    printf("Appending to file: %s\n", filename);
+    // File data is everything after the header
+    char *filedata = sep + 1;
+    size_t data_len = buf_len - header_len;
+
+    printf("Appending %zu bytes to file: %s\n", data_len, filename);
 
     FILE *fp = fopen(filename, "ab");
     if (!fp) {
@@ -114,14 +114,8 @@ void get_handler(char *buf, int buf_len) {
         return;
     }
 
-    // Calculate actual data length (from filedata to end of buffer)
-    size_t data_len = buf_len - (filedata - buf);
-    
-    // Write the raw data as-is
     fwrite(filedata, 1, data_len, fp);
     fclose(fp);
-
-    printf("Appended %zu bytes to file: %s\n", data_len, filename);
 }
 
 
@@ -145,10 +139,56 @@ void put_handler(server_res_info server_info, char *filename, int ack_num) {
     printf("Sending file: %s (%ld bytes)\n", filename, file_size);
 
     char file_buffer[BUFSIZE]; 
+    char ack_buffer[BUFSIZE]; 
+    char last_buffer[BUFSIZE];
     size_t bytes_read; 
     int fram_num = 0; 
 
     while((bytes_read = fread(file_buffer, 1, BUFSIZE - 100, file_ptr)) > 0) { 
+        int n = recvfrom( 
+            server_info.sockfd, 
+            file_buffer, 
+            sizeof(file_buffer), 
+            0,
+            (struct sockaddr *) &server_info.serveraddr, 
+            (socklen_t *) &server_info.serverlen
+        ); 
+        if (n < 0) { 
+            if (errno == EWOULDBLOCK || errno == EAGAIN) { 
+                printf("Timeout waiting for ACK\n"); 
+                // resend last packet
+                if (fram_num > 0) { 
+                    printf("Resending frame %d\n", fram_num - 1); 
+                    int resend_n = sendto( 
+                        server_info.sockfd, 
+                        file_buffer, 
+                        strlen(file_buffer), 
+                        0, 
+                        (struct sockaddr *) &server_info.serveraddr, 
+                        server_info.serverlen
+                    ); 
+                    if (resend_n < 0) { 
+                        perror("sendto failed"); 
+                        break; 
+                    } 
+                } 
+                continue; 
+            } else { 
+                perror("recvfrom failed"); 
+                break; 
+            } 
+        }
+        else if (n > 0) {
+            if (n < BUFSIZE) ack_buffer[n] = '\0'; 
+            if (strncasecmp(ack_buffer, "GOTIT(SERVER):", 14) == 0) { 
+                printf("Recieved ACK from server: %s\n", ack_buffer); 
+            }
+            else {
+                printf("Received unexpected message: %s\n", ack_buffer); 
+                return; 
+            }
+        }
+        
         printf("READ %zu bytes from file\n", bytes_read); 
         char packet[BUFSIZE]; 
 
@@ -160,8 +200,10 @@ void put_handler(server_res_info server_info, char *filename, int ack_num) {
         memcpy(packet + header_len, file_buffer, bytes_read);
         int total_len = header_len + bytes_read;
 
+        memcpy(last_buffer, packet, total_len); 
+
         // Send the complete packet with actual byte count
-        int n = sendto(
+        n = sendto(
             server_info.sockfd, 
             packet, 
             total_len,  // Use actual length, not strlen()
@@ -179,7 +221,7 @@ void put_handler(server_res_info server_info, char *filename, int ack_num) {
                fram_num, bytes_read, header_len, total_len);
         fram_num++;
 
-        usleep(1000); 
+        // usleep(1000); 
     }
     fclose(file_ptr);
 
@@ -228,7 +270,7 @@ int handle_ACK(char* buf, SWS_info *sender_window, server_res_info sender_info, 
         char filename[256];
         if (sscanf(buf + 8, "%255[^|]", filename) == 1) {  // read until '|'
             printf("Received PUTFILE command. Filename: %s\n", filename);
-            get_handler(buf, n);
+            get_handler(buf, n, sender_info);
             return 0;
         } else {
             fprintf(stderr, "Malformed PUTFILE packet: %s\n", buf);
@@ -283,7 +325,7 @@ int handle_ACK(char* buf, SWS_info *sender_window, server_res_info sender_info, 
 
     }
     else { 
-        get_handler(buf, n); 
+        get_handler(buf, n, sender_info); 
         printf("Received out-of-order ACK: %d (expected %d)\n", acknum, (sender_window->LAR + 1) % ARRAY_SIZE);
         return -1;
     }
