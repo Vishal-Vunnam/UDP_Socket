@@ -13,16 +13,41 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <dirent.h> // for handle_ls
+#include <ctype.h>
 
 #define BUFSIZE 1024
 #define RWS 4
-#define ARRAY_SIZE 25
+#define ARRAY_SIZE 10
 
 typedef struct {
     int sockfd;
     struct sockaddr_in clientaddr;
     int clientlen;
 } client_res_info;
+
+typedef struct { 
+    int LAR; 
+    int LFS; 
+    int frame_ptr; 
+    int frame_size; 
+    struct sendQ_data_slot { 
+        char msg[BUFSIZE]; 
+        int acked; 
+        time_t send_time; 
+    } sendQ[ARRAY_SIZE]; 
+} SWS_file_info; 
+
+typedef struct {
+   int LFR; 
+   int LAF; 
+   int frame_ptr; 
+   int frame_size;  
+   struct recQ_data_slot {
+    int received; 
+    char msg[BUFSIZE];
+   } recQ[ARRAY_SIZE];
+} RWS_file_info; 
+
 
 typedef struct {
    int LFR; 
@@ -35,6 +60,8 @@ typedef struct {
    } recQ[ARRAY_SIZE];
 } RWS_info; 
 
+
+
 /* Function declarations */
 void handle_ls(client_res_info response_info, char *buf, int ack_num);
 void handle_exit(client_res_info response_info, char *buf, int ack_num);
@@ -44,6 +71,9 @@ void handle_delete(client_res_info response_info, char *buf, int ack_num);
 void error(const char *msg);
 int sender(client_res_info response_info, char *response, char *return_code, int acknum);
 int input_transfer(client_res_info response_info, char *buf, int acknum);
+void put_helper(char * buf, int buf_len, client_res_info response_info); 
+
+
 
 void error(const char *msg) {
     perror(msg);
@@ -60,8 +90,31 @@ void init_RWS(RWS_info *receiver_window, int frame_size) {
         memset(receiver_window->recQ[i].msg, 0, BUFSIZE);
     } 
 }
+
+void init_put_RWS(RWS_file_info *receiver_window, int frame_size) { 
+    receiver_window->LFR = -1; 
+    receiver_window->LAF = -1;
+    receiver_window->frame_ptr = 0; 
+    receiver_window->frame_size = frame_size; 
+    for (int i = 0; i < ARRAY_SIZE; i++) { 
+        receiver_window->recQ[i].received = 0; 
+        memset(receiver_window->recQ[i].msg, 0, BUFSIZE);
+    } 
+}
+
+void init_get_SWS(SWS_file_info *sender_window, int frame_size) { 
+    sender_window -> LAR = -1; 
+    sender_window -> LFS = -1; 
+    sender_window -> frame_ptr = 0; 
+    sender_window -> frame_size = frame_size; 
+    for (int i = 0; i < ARRAY_SIZE; i++) { 
+        sender_window -> sendQ[i].acked = 1; 
+        memset(sender_window->sendQ[i].msg, 0, BUFSIZE);
+    }
+}
+
 int window_handler(int ack_num, RWS_info *receiver_window) { 
-    if(ack_num == (receiver_window->LFR + 1) % RWS) { 
+    if(ack_num == (receiver_window->LFR + 1) % ARRAY_SIZE) { 
         receiver_window->LFR = (receiver_window->LFR + 1) % ARRAY_SIZE; 
         return 0; 
     }
@@ -136,15 +189,18 @@ void handle_get(client_res_info response_info, char *buf, int ack_num) {
     buf += 4; // skip "get "
     buf[strcspn(buf, "\r\n ")] = '\0'; 
     printf("Requested file: %s\n", buf);
+    
     FILE *file_ptr = fopen(buf, "rb");
+
     if (!file_ptr) {
-        printf("FILE WAS NOT FOUND"); 
+        printf("FILE WAS NOT FOUND\n"); 
         sender(response_info, "File not found", NULL, ack_num); 
         perror("File not found");
         return;
     }
 
-    sender(response_info, "Starting file transfer", NULL, ack_num); 
+    // char *ack_msg = strcspn("touchfile:", buf);
+    sender(response_info, buf, NULL, ack_num); 
     fseek(file_ptr, 0, SEEK_END);
     long file_size = ftell(file_ptr);
     fseek(file_ptr, 0, SEEK_SET);
@@ -155,49 +211,64 @@ void handle_get(client_res_info response_info, char *buf, int ack_num) {
     size_t bytes_read;
     int frame_num = 0;
 
-    while ((bytes_read = fread(file_buffer, 1, BUFSIZE - 50, file_ptr)) > 0) {
-        // Frame the packet: "<ack_num> | <data>"
+    while ((bytes_read = fread(file_buffer, 1, BUFSIZE - 100, file_ptr)) > 0) {
         char packet[BUFSIZE];
-        memset(packet, 0, sizeof(packet));
         
-        int len = snprintf(packet, sizeof(packet), "%s | ", buf);
+        // Build the header: "putfile:filename | "
+        int header_len = snprintf(packet, sizeof(packet), "putfile:%s|", buf);
+        
+        // CRITICAL: Don't use snprintf for the data part - it stops at null bytes!
+        // Just copy the binary data directly after the header
+        memcpy(packet + header_len, file_buffer, bytes_read);
+        int total_len = header_len + bytes_read;
 
-        // Make sure we don’t overflow
-        memcpy(packet + len, file_buffer, bytes_read);
-        len += bytes_read;
-
-        // Send the framed message
-        int n = sender(response_info, packet, NULL, ack_num); 
+        // Send the complete packet with actual byte count
+        int n = sendto(
+            response_info.sockfd, 
+            packet, 
+            total_len,  // Use actual length, not strlen()
+            0, 
+            (struct sockaddr *) &response_info.clientaddr, 
+            response_info.clientlen
+        );
 
         if (n < 0) {
             perror("sendto failed");
             break;
         }
 
-        printf("Sent frame %d (%zu bytes)\n", ack_num + frame_num, bytes_read);
+        printf("Sent frame %d (%zu bytes data + %d bytes header = %d total)\n", 
+               frame_num, bytes_read, header_len, total_len);
         frame_num++;
 
-        // Optionally wait for ACK here before sending next frame (if reliable)
+        // Small delay to avoid overwhelming the receiver (optional)
+        usleep(1000); // 1ms delay
     }
 
     fclose(file_ptr);
 
-    // Optionally send end-of-file marker
-    char end_msg[64];
-    snprintf(end_msg, sizeof(end_msg), "%d | END", ack_num);
-    sender(response_info, end_msg, NULL, ack_num); 
+    // Send end-of-file marker
+    // char end_msg[64];
+    // snprintf(end_msg, sizeof(end_msg), "%d|END", ack_num);
+    // sender(response_info, end_msg, NULL, ack_num); 
 
-    printf("File transfer complete.\n");
+    printf("File transfer complete: %d frames sent\n", frame_num);
 }
+
+
 
 
 void handle_put(client_res_info response_info, char *buf, int ack_num) {
     if (buf != NULL) buf += 4; 
     else return; 
 
+    buf[strcspn(buf, "\r\n ")] = '\0';
 
+    printf("Requested to put file: %s\n", buf); 
 
-
+    char response[BUFSIZE];
+    snprintf(response, sizeof(response), "gimmefile:%s", buf);
+    sender(response_info, response, NULL, ack_num); 
 
 
     (void)response_info;
@@ -206,20 +277,87 @@ void handle_put(client_res_info response_info, char *buf, int ack_num) {
 
 }
 
+
+void put_helper(char *buf, int buf_len, client_res_info response_info) {
+    if (buf == NULL || buf_len <= 0) return;
+
+    // Expected format: "putfile:filename | data..."
+    char *original_buf = buf;  // Save original pointer
+    
+    // Skip "putfile:" (8 characters)
+    buf += 8;
+    buf_len -= 8;  // Adjust length too!
+
+    // Find the separator between filename and data
+    char *sep = strstr(buf, "|");
+    if (!sep) {
+        fprintf(stderr, "Malformed putfile command (missing '|'): %s\n", buf);
+        return;
+    }
+
+    // Extract filename
+    char filename[128];
+    memset(filename, 0, sizeof(filename));
+
+    // Copy part before '|'
+    int filename_len = sep - buf;
+    strncpy(filename, buf, filename_len);
+    filename[filename_len] = '\0';  // Ensure null termination
+
+    // Trim trailing spaces from filename
+    char *end = filename + strlen(filename) - 1;
+    while (end > filename && isspace((unsigned char)*end)) *end-- = '\0';
+
+    // Move sep past '|' to get payload
+    sep++;
+    
+    // Calculate data length: total remaining bytes after '|'
+    size_t data_len = buf_len - (sep - buf);
+    
+    if (data_len <= 0) {
+        fprintf(stderr, "No payload found in command.\n");
+        return;
+    }
+
+    printf("Writing %zu bytes to file: %s\n", data_len, filename);
+
+    // Open file for appending
+    FILE *fp = fopen(filename, "ab");
+    if (!fp) {
+        perror("fopen");
+        return;
+    }
+
+    // Write data to file
+    size_t written = fwrite(sep, 1, data_len, fp);
+    fclose(fp);
+
+    if (written != data_len) {
+        fprintf(stderr, "Warning: wrote %zu bytes but expected %zu\n", written, data_len);
+    }
+
+    printf("Successfully wrote %zu bytes to file: %s\n", written, filename);
+}
+
+
 void handle_delete(client_res_info response_info, char *buf, int ack_num) {
     (void)response_info;
     if (buf != NULL) buf += 7;
     else return;
-
+    buf[strcspn(buf, "\r\n ")] = '\0'; 
     int status = remove(buf);
 
     if (status == 0) {
         printf("File '%s' deleted successfully.\n", buf);
+        sender(response_info, "File deleted successfully", NULL, ack_num); 
     } else {
         printf("Error deleting file '%s'.\n", buf);
+        sender(response_info, "File deletion failed", NULL, ack_num); 
         perror("Error details"); 
     }
 }
+
+
 
 void handle_ls(client_res_info response_info, char *buf, int ack_num) {
     (void)buf;
@@ -254,6 +392,8 @@ void handle_ls(client_res_info response_info, char *buf, int ack_num) {
     sender(response_info, response, NULL, ack_num);
     return; 
 }
+
+
 
 void handle_exit(client_res_info response_info, char *buf, int ack_num) {
     (void)response_info;
@@ -324,7 +464,7 @@ int main(int argc, char **argv) {
             error("ERROR on inet_ntoa");
         printf("server received datagram from %s (%s)\n", 
                hostp->h_name, hostaddrp);
-        printf("server received %d/%d bytes: %s\n", (int)strlen(buf), n, buf);
+        // printf("server received %d/%d bytes: %s\n", (int)strlen(buf), n, buf);
         
         client_res_info client_info;
         client_info.sockfd = sockfd;
@@ -333,6 +473,14 @@ int main(int argc, char **argv) {
 
         if (n > 0) {
             int acknum = -1;
+
+
+            if (strncmp(buf, "putfile:", 8) == 0) {
+                // printf("PUTFILE handled separately. THIS IS BUF %s\n", buf);
+                put_helper(buf, n, client_info); 
+                continue; 
+            }
+
             char *cmd_start = strstr(buf, "|");
 
             if (cmd_start == NULL) {
@@ -340,7 +488,6 @@ int main(int argc, char **argv) {
                 return -1;
             }
             *cmd_start = '\0';
-
             // Extract acknum
             if (sscanf(buf, "%d", &acknum) != 1) {
                 fprintf(stderr, "Malformed ACK number: %s\n", buf);
@@ -356,7 +503,8 @@ int main(int argc, char **argv) {
             printf("Command buffer: %s\n", cmd_start);
 
             // Pass *only* the command part to input_transfer
-            if (window_handler(acknum, &receiver_window) ==0) input_transfer(client_info, cmd_start, acknum);
+            if (window_handler(acknum, &receiver_window) == 0) input_transfer(client_info, cmd_start, acknum);
+            // else if (strncmp(cmd_start, "putfile:", 8) == 0) put_helper(buf, n, client_info); 
             else printf("Ignoring out-of-order ACK: %d\n", acknum);
         }
         else {

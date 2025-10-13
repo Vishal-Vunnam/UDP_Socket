@@ -106,12 +106,12 @@ def send_and_capture(master_fd: int, line: str, read_timeout: float = 3.0) -> st
     return buf.decode("utf-8", "ignore")
 
 def send_and_wait_silent(master_fd: int, line: str, wait_secs: float):
-    print(f"[CMD] {line}  (silent)")
+    print(f"[CMD] {line}")
     drain_pty(master_fd, 0.05)
     if not line.endswith("\n"): line += "\n"
     os.write(master_fd, line.encode("utf-8", "ignore"))
-    drain_pty(master_fd, wait_secs)  # silently drain to avoid PTY backpressure
 
+    drain_pty(master_fd, wait_secs)
 # ---------- hashing ----------
 def sha256(path: str) -> str | None:
     if not os.path.exists(path): return None
