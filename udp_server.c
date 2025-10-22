@@ -199,7 +199,7 @@ void put_helper(char *filename, char *data_buf, int data_len, int frame_num){
     char gimme_buf[BUFSIZE];
     snprintf(gimme_buf, sizeof(gimme_buf), "gotfile:%s", filename);
 
-    ack_sender(gimme_buf, "ACK:PUT", frame_num);
+    ack_sender(gimme_buf, "ACK:PUT_Confirm", frame_num);
 }
 
 
@@ -247,6 +247,17 @@ int client_input_handler(char *buf, int buf_len, RWS_info *receiver_window) {
     printf("Ack type: '%s'\n", ack_type);
     printf("Message: '%s'\n", msg);
 
+    // Point cmd_start to the second '|' so later code can skip past ack_type
+    char *cmd_start = second_delim;
+
+    printf("Received frame number: %d\n", frame_num);
+    printf("Recieved full message: %s\n", buf);
+    // Check if frame number is expected
+    if (handle_frame_num(frame_num, receiver_window) < 0) { 
+        return -1; 
+    }
+
+
     if(strncmp(ack_type, "putfile:", 8) == 0) { 
         put_helper(ack_type + 8, msg, buf_len - (msg - buf), frame_num);
         return frame_num;
@@ -256,16 +267,6 @@ int client_input_handler(char *buf, int buf_len, RWS_info *receiver_window) {
         printf("Finished receiving file data for frame %d\n", frame_num);
         ack_sender("File transfer complete.", "ACK:PUT_END", frame_num);
         return frame_num;
-    }
-
-    // Point cmd_start to the second '|' so later code can skip past ack_type
-    char *cmd_start = second_delim;
-
-    printf("Received frame number: %d\n", frame_num);
-    printf("Recieved full message: %s\n", buf);
-    // Check if frame number is expected
-    if (handle_frame_num(frame_num, receiver_window) < 0) { 
-        return -1; 
     }
 
     // Move to command part (skip '|' and spaces)

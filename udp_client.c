@@ -56,6 +56,7 @@ server_res_info global_server_info;
 
 // Global file pointer for reading file data
 FILE *global_read_fp = NULL;
+char *global_filename = NULL;
 
 // Global file pointer for writing file data
 FILE *global_write_fp = NULL;
@@ -97,6 +98,7 @@ int command_valid(char *cmd) {
         return 1; 
     return 0;
 }
+
 
 
 int send_frame(char *s_msg, char* msg_type, int msg_len, SWS_info *sender_window) {
@@ -144,6 +146,7 @@ int handle_user_input(char *buf, int buf_len, SWS_info *sender_window) {
 int send_next_file_chunk(SWS_info *sender_window, const char *filename) { 
     if (!global_read_fp) { 
         global_read_fp = fopen(filename, "rb"); 
+        global_filename = strdup(filename);
         if (!global_read_fp) { 
             perror("fopen");
             return -1; 
@@ -166,24 +169,26 @@ int send_next_file_chunk(SWS_info *sender_window, const char *filename) {
 
             printf("SENDING MESSAGE: %s\n", msg);
             
-            int n = sendto(
-                global_server_info.sockfd, 
-                msg, 
-                strlen(msg), 
-                0, 
-                (struct sockaddr *) &global_server_info.serveraddr, 
-                global_server_info.serverlen
-            );
+            // int n = sendto(
+            //     global_server_info.sockfd, 
+            //     msg, 
+            //     strlen(msg), 
+            //     0, 
+            //     (struct sockaddr *) &global_server_info.serveraddr, 
+            //     global_server_info.serverlen
+            // );
 
-            sender_window->LFS = (sender_window->LFS + 1) % ARRAY_SIZE;
-            sender_window->sendQ[sender_window->LFS].acked = 0;
-            sender_window->sendQ[sender_window->LFS].send_time = time(NULL);
-            strncpy(sender_window->sendQ[sender_window->LFS].msg, msg, BUFSIZE);
-            sender_window->sendQ[sender_window->LFS].msg_len = strlen(msg); 
+            // sender_window->LFS = (sender_window->LFS + 1) % ARRAY_SIZE;
+            // sender_window->sendQ[sender_window->LFS].acked = 0;
+            // sender_window->sendQ[sender_window->LFS].send_time = time(NULL);
+            // strncpy(sender_window->sendQ[sender_window->LFS].msg, msg, BUFSIZE);
+            // sender_window->sendQ[sender_window->LFS].msg_len = strlen(msg); 
+
+            int n = send_frame(file_buf, msg_type, bytes_read, sender_window);
 
 
             if (n < 0) {
-                fprintfs(stderr, "Failed to send file chunk for %s\n", filename);
+                fprintf(stderr, "Failed to send file chunk for %s\n", filename);
                 return -1; 
             }
         } else {
@@ -193,6 +198,8 @@ int send_next_file_chunk(SWS_info *sender_window, const char *filename) {
                 perror("fread");
             }
             fclose(global_read_fp);
+            free(global_filename);
+            global_filename = NULL;
             send_frame("EOF", "putfile_end", 12, sender_window);
             global_read_fp = NULL;
             return 0; 
@@ -206,6 +213,7 @@ int check_ack_num(int ack_num, SWS_info *sender_window) {
         fprintf(stderr, "Invalid ACK number: %d\n", ack_num);
         return -1; 
     }
+    printf("Checking ACK number: %d\n", ack_num);
 
     if (!sender_window->sendQ[ack_num].acked) { 
         sender_window->sendQ[ack_num].acked = 1; 
@@ -218,8 +226,15 @@ int check_ack_num(int ack_num, SWS_info *sender_window) {
         }
         return 0; 
     } else {
-        printf("Duplicate ACK received for frame %d\n", ack_num);
-        return -1; 
+
+        if (ack_num > sender_window->LAR && ack_num <= sender_window->LFS) {
+            printf("Duplicate ACK received for frame %d\n", ack_num);
+            return -1; 
+        }
+        else { 
+            fprintf(stderr, "ACK number %d out of current window [%d, %d]\n", ack_num, (sender_window->LAR + 1) % ARRAY_SIZE, sender_window->LFS);
+            return -1;
+        }
     }
 }
 
@@ -269,9 +284,11 @@ int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window) {
         }
     }
 
-    if (sender_window->LAR < sender_window->LFS) { 
-
-        
+    // IF READ FILE IS STILL OPEN, TRY TO SEND NEXT CHUNK
+    if (global_read_fp) {
+        if (send_next_file_chunk(sender_window, global_filename) < 0) {
+            fprintf(stderr, "Failed to send next file chunk\n");
+        }
     }
     return 0;
 
@@ -279,10 +296,28 @@ int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window) {
 
 void handle_timeout(SWS_info *sender_window, int sockfd, struct sockaddr_in serveraddr, int serverlen) {
     // placeholder to compile cleanly
-    (void)sender_window;
-    (void)sockfd;
-    (void)serveraddr;
-    (void)serverlen;
+    // (void)sender_window;
+    // (void)sockfd;
+    // (void)serveraddr;
+    // (void)serverlen;
+    for (int i = sender_window->LAR; i != sender_window->LFS; i = (i + 1) & ARRAY_SIZE) { 
+        printf("Resending frame %d\n", i);
+        sender_window->sendQ[i].send_time = time(NULL);
+        int n = sendto(
+            sockfd, 
+            sender_window->sendQ[i].msg, 
+            strlen(sender_window->sendQ[i].msg), 
+            0, 
+            (struct sockaddr *)&serveraddr, 
+            serverlen
+        );
+        if (n < 0) {
+            perror("ERROR resending frame");
+        }
+
+        sender_window->sendQ[i].send_time = time(NULL);
+        sender_window->sendQ[i].acked = 0;
+    }
 }
 
 
