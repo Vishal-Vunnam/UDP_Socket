@@ -122,7 +122,7 @@ int send_frame(char *s_msg, char* msg_type, int msg_len, SWS_info *sender_window
     sender_window->LFS = seq_num;
     sender_window->sendQ[seq_num].acked = 0;
     sender_window->sendQ[seq_num].send_time = time(NULL);
-    strncpy(sender_window->sendQ[seq_num].msg, s_msg, BUFSIZE);
+    strncpy(sender_window->sendQ[seq_num].msg, msg_with_seq, BUFSIZE);
 
     return n;
 }
