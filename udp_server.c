@@ -175,6 +175,11 @@ int handle_frame_num(int frame_num, RWS_info *receiver_window) {
         receiver_window->LFR = (receiver_window->LFR + 1) % ARRAY_SIZE; 
         return 0; 
     }
+    else if (frame_num >= (receiver_window->LFR + 1 - RWS) % ARRAY_SIZE && frame_num <= (receiver_window->LFR) % ARRAY_SIZE) { 
+        printf("Duplicate frame received: %d\n", frame_num);
+        ack_sender("Duplicate frame", "ACK:DUPLICATE", frame_num);
+        return 1; 
+    }
     else { 
         printf("Out of order frame received: %d, expected %d\n", frame_num, (receiver_window->LFR + 1) % ARRAY_SIZE);
         return -1; 
