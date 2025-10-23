@@ -224,6 +224,11 @@ int check_ack_num(int ack_num, SWS_info *sender_window) {
     }
     printf("Checking ACK number: %d\n", ack_num);
 
+    if (ack_num != (sender_window->LAR + 1) % ARRAY_SIZE) {
+        fprintf(stderr, "ACK number %d not in expected range [%d, %d]\n", 
+                ack_num, (sender_window->LAR + 1) % ARRAY_SIZE, sender_window->LFS);
+        return -1; 
+    }
     if (!sender_window->sendQ[ack_num].acked) { 
         sender_window->sendQ[ack_num].acked = 1; 
         printf("ACK received for frame %d\n", ack_num);
