@@ -105,15 +105,20 @@ int send_frame(char *s_msg, char* msg_type, int msg_len, SWS_info *sender_window
     int seq_num = (sender_window->LFS + 1) % ARRAY_SIZE; 
 
     char msg_with_seq[BUFSIZE];
-    snprintf(msg_with_seq, BUFSIZE, "%d | %s | %s", seq_num, msg_type, s_msg);
+    int header_len = snprintf(msg_with_seq, BUFSIZE, "%d | %s | ", seq_num, msg_type);
+    
+    // Copy binary data after header
+    memcpy(msg_with_seq + header_len, s_msg, msg_len);
+    int total_len = header_len + msg_len;
 
     if (sender_window->LFS - sender_window->LAR >= SWS) { 
         printf("Window full, cannot send frame %d now.\n", seq_num);
         return 0; 
     }
 
-    int n = sendto(global_server_info.sockfd, msg_with_seq, strlen(msg_with_seq), 0, 
-                   (struct sockaddr *)&global_server_info.serveraddr, global_server_info.serverlen);
+    int n = sendto(global_server_info.sockfd, msg_with_seq, total_len, 0, 
+                   (struct sockaddr *)&global_server_info.serveraddr, 
+                   global_server_info.serverlen);
     if (n < 0) {
         perror("ERROR sending frame");
         return -1;
@@ -122,10 +127,12 @@ int send_frame(char *s_msg, char* msg_type, int msg_len, SWS_info *sender_window
     sender_window->LFS = seq_num;
     sender_window->sendQ[seq_num].acked = 0;
     sender_window->sendQ[seq_num].send_time = time(NULL);
-    strncpy(sender_window->sendQ[seq_num].msg, msg_with_seq, BUFSIZE);
+    memcpy(sender_window->sendQ[seq_num].msg, msg_with_seq, total_len);
+    sender_window->sendQ[seq_num].msg_len = total_len;
 
     return n;
 }
+
 
 int handle_user_input(char *buf, int buf_len, SWS_info *sender_window) { 
     if (!command_valid(buf)) { 
@@ -154,43 +161,45 @@ int send_next_file_chunk(SWS_info *sender_window, const char *filename) {
     }
 
     while(sender_window->LFS - sender_window->LAR < SWS) {
-        printf("spinning here?");
-
-        char file_buf[BUFSIZE - 64]; 
+        char file_buf[BUFSIZE - 128]; // Leave room for header
         size_t bytes_read = fread(file_buf, 1, sizeof(file_buf), global_read_fp); 
-        printf("Read %zu bytes from file %s\n", bytes_read, filename);
+        
         if (bytes_read > 0) { 
             char msg_type[124]; 
             snprintf(msg_type, sizeof(msg_type), "putfile:%s", filename);
-            char msg[BUFSIZE]; 
-            snprintf(msg, sizeof(msg), "%d | putfile:%s | %s", 
-                     (sender_window->LFS + 1) % ARRAY_SIZE, filename, file_buf);
-
-
-            printf("SENDING MESSAGE: %s\n", msg);
             
-            // int n = sendto(
-            //     global_server_info.sockfd, 
-            //     msg, 
-            //     strlen(msg), 
-            //     0, 
-            //     (struct sockaddr *) &global_server_info.serveraddr, 
-            //     global_server_info.serverlen
-            // );
+            // ✅ Build header separately, then append binary data
+            char msg[BUFSIZE];
+            int seq_num = (sender_window->LFS + 1) % ARRAY_SIZE;
+            int header_len = snprintf(msg, sizeof(msg), "%d | putfile:%s | ", 
+                                     seq_num, filename);
+            
+            // Copy binary data after header
+            memcpy(msg + header_len, file_buf, bytes_read);
+            int total_len = header_len + bytes_read;
 
-            // sender_window->LFS = (sender_window->LFS + 1) % ARRAY_SIZE;
-            // sender_window->sendQ[sender_window->LFS].acked = 0;
-            // sender_window->sendQ[sender_window->LFS].send_time = time(NULL);
-            // strncpy(sender_window->sendQ[sender_window->LFS].msg, msg, BUFSIZE);
-            // sender_window->sendQ[sender_window->LFS].msg_len = strlen(msg); 
+            // Send with actual byte count, not strlen
+            if (sender_window->LFS - sender_window->LAR >= SWS) { 
+                printf("Window full, cannot send frame %d now.\n", seq_num);
+                return 0; 
+            }
 
-            int n = send_frame(file_buf, msg_type, bytes_read, sender_window);
-
-
+            int n = sendto(global_server_info.sockfd, msg, total_len, 0, 
+                          (struct sockaddr *)&global_server_info.serveraddr, 
+                          global_server_info.serverlen);
+            
             if (n < 0) {
                 fprintf(stderr, "Failed to send file chunk for %s\n", filename);
                 return -1; 
             }
+
+            // Update window state
+            sender_window->LFS = seq_num;
+            sender_window->sendQ[seq_num].acked = 0;
+            sender_window->sendQ[seq_num].send_time = time(NULL);
+            memcpy(sender_window->sendQ[seq_num].msg, msg, total_len);
+            sender_window->sendQ[seq_num].msg_len = total_len;  // ✅ Store actual length
+
         } else {
             if (feof(global_read_fp)) {
                 printf("Finished sending file: %s\n", filename);
@@ -200,13 +209,13 @@ int send_next_file_chunk(SWS_info *sender_window, const char *filename) {
             fclose(global_read_fp);
             free(global_filename);
             global_filename = NULL;
-            send_frame("EOF", "putfile_end", 12, sender_window);
+            send_frame("EOF", "putfile_end", 3, sender_window);  // Send actual length
             global_read_fp = NULL;
             return 0; 
         }
     }
+    return 0;
 }
-
 // ---------RECEIVING ALGORITHMS----------
 int check_ack_num(int ack_num, SWS_info *sender_window) { 
     if (ack_num < 0 || ack_num >= ARRAY_SIZE) {
@@ -257,22 +266,26 @@ int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window) {
 
     // move pointer to payload after first '|'
     char *payload = sep + 1;
-    while (isspace((unsigned char)*payload)) payload++;
+    // ✅ Skip only single space after '|' if present
+    if (*payload == ' ') payload++;
 
     // If there's an ACK/type field (e.g. "ACK | gimmefile:..."), skip it and the next '|'
     if (strncmp(payload, "ACK", 3) == 0) {
         char *p = strchr(payload, '|');
         if (p) {
             payload = p + 1;
-            while (isspace((unsigned char)*payload)) payload++;
+            if (*payload == ' ') payload++;  // ✅ Skip single space only
         }
     }
 
-    // Now payload should be the command, e.g. "gimmefile:foo1"
-    if (strncmp(payload, "gimmefile:", 9) == 0) {
+    // Now strip whitespace ONLY for command parsing, not for binary data
+    char *cmd = payload;
+    while (isspace((unsigned char)*cmd)) cmd++;
+
+    if (strncmp(cmd, "gimmefile:", 10) == 0) {
         char filename[256];
-        char *fname = payload + 9;
-        // skip any leading colons and whitespace so filename won't start with ':'
+        char *fname = cmd + 10;
+        // skip any leading colons and whitespace for filename parsing
         while (*fname && (isspace((unsigned char)*fname) || *fname == ':')) fname++;
         if (sscanf(fname, "%255s", filename) == 1) {
             printf("Requested file: %s\n", filename);
@@ -291,35 +304,30 @@ int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window) {
         }
     }
     return 0;
-
 }
 
 
 
 void handle_timeout(SWS_info *sender_window, int sockfd, struct sockaddr_in serveraddr, int serverlen) {
-    // placeholder to compile cleanly
-    // (void)sender_window;
-    // (void)sockfd;
-    // (void)serveraddr;
-    // (void)serverlen;
-    for (int i = sender_window->LAR + 1; i != (sender_window->LFS + 1) % ARRAY_SIZE; i = (i + 1) & ARRAY_SIZE) { 
-        printf("Resending frame %d\n", i);
-        printf("RESENDING MESSAGE: %s\n", sender_window->sendQ[i].msg);
-        sender_window->sendQ[i].send_time = time(NULL);
-        int n = sendto(
-            sockfd, 
-            sender_window->sendQ[i].msg, 
-            strlen(sender_window->sendQ[i].msg), 
-            0, 
-            (struct sockaddr *)&serveraddr, 
-            serverlen
-        );
-        if (n < 0) {
-            perror("ERROR resending frame");
+    for (int i = (sender_window->LAR + 1) % ARRAY_SIZE; 
+         i != (sender_window->LFS + 1) % ARRAY_SIZE; 
+         i = (i + 1) % ARRAY_SIZE) { 
+        
+        if (!sender_window->sendQ[i].acked) {
+            printf("Resending frame %d\n", i);
+            sender_window->sendQ[i].send_time = time(NULL);
+            
+            // ✅ Use stored msg_len instead of strlen
+            int n = sendto(sockfd, 
+                          sender_window->sendQ[i].msg, 
+                          sender_window->sendQ[i].msg_len,  // Use actual length!
+                          0, 
+                          (struct sockaddr *)&serveraddr, 
+                          serverlen);
+            if (n < 0) {
+                perror("ERROR resending frame");
+            }
         }
-
-        sender_window->sendQ[i].send_time = time(NULL);
-        sender_window->sendQ[i].acked = 0;
     }
 }
 

@@ -207,6 +207,7 @@ void put_helper(char *filename, char *data_buf, int data_len, int frame_num){
 int client_input_handler(char *buf, int buf_len, RWS_info *receiver_window) { 
     printf("CLIENT BUFFER: %s\n", buf);
     if(buf == NULL || buf_len <= 0) return -1;
+    
     // Input format: "<acknum> | <ack_type> | <msg>"
     char *first_delim = strchr(buf, '|');
     if (first_delim == NULL) {
@@ -233,33 +234,31 @@ int client_input_handler(char *buf, int buf_len, RWS_info *receiver_window) {
     *second_delim = '\0';
     char *ack_type = first_delim + 1;
 
-    // Trim leading/trailing spaces in ack_type
-    while (isspace((unsigned char)*ack_type)) ack_type++;  // remove leading spaces
+    // Trim leading/trailing spaces in ack_type ONLY
+    while (isspace((unsigned char)*ack_type)) ack_type++;
     char *end = ack_type + strlen(ack_type) - 1;
     while (end > ack_type && isspace((unsigned char)*end)) *end-- = '\0';
 
-    // Extract msg (the remainder after second '|')
+    // Extract msg - DON'T strip whitespace for binary data!
     char *msg = second_delim + 1;
-    while (isspace((unsigned char)*msg)) msg++; // remove leading spaces
+    // ✅ Skip only the single space after '|' if present
+    if (*msg == ' ') msg++;
+    
+    // Calculate actual data length
+    int data_len = buf_len - (msg - buf);
 
-    // Now you have:
     printf("Frame number: %d\n", frame_num);
     printf("Ack type: '%s'\n", ack_type);
-    printf("Message: '%s'\n", msg);
+    printf("Data length: %d bytes\n", data_len);
 
-    // Point cmd_start to the second '|' so later code can skip past ack_type
-    char *cmd_start = second_delim;
-
-    printf("Received frame number: %d\n", frame_num);
-    printf("Recieved full message: %s\n", buf);
     // Check if frame number is expected
     if (handle_frame_num(frame_num, receiver_window) < 0) { 
         return -1; 
     }
 
-
+    // Handle binary file data
     if(strncmp(ack_type, "putfile:", 8) == 0) { 
-        put_helper(ack_type + 8, msg, buf_len - (msg - buf), frame_num);
+        put_helper(ack_type + 8, msg, data_len, frame_num);
         return frame_num;
     }
 
@@ -269,29 +268,28 @@ int client_input_handler(char *buf, int buf_len, RWS_info *receiver_window) {
         return frame_num;
     }
 
-    // Move to command part (skip '|' and spaces)
-    cmd_start++;
-    while (*cmd_start == ' ') cmd_start++;
-    cmd_start[strcspn(cmd_start, "\n")] = '\0'; // remove newline
-    printf("Command buffer: %s\n", cmd_start);  
+    // For text commands, NOW we can strip whitespace
+    while (isspace((unsigned char)*msg)) msg++;
+    msg[strcspn(msg, "\n")] = '\0';
+    printf("Command buffer: %s\n", msg);  
 
-    if(strcmp(cmd_start, "ls") == 0) { 
+    if(strcmp(msg, "ls") == 0) { 
         handle_ls(frame_num); 
     } 
-    else if (strcmp(cmd_start, "exit") == 0) {
+    else if (strcmp(msg, "exit") == 0) {
         handle_exit(frame_num); 
     } 
-    else if (strncmp(cmd_start, "get", 3) == 0) {
-        handle_get(cmd_start, frame_num);
+    else if (strncmp(msg, "get", 3) == 0) {
+        handle_get(msg, frame_num);
     } 
-    else if (strncmp(cmd_start, "put", 3) == 0) {
-        handle_put(cmd_start, frame_num);
+    else if (strncmp(msg, "put", 3) == 0) {
+        handle_put(msg, frame_num);
     } 
-    else if (strncmp(cmd_start, "delete", 6) == 0) {
-        handle_delete(cmd_start, frame_num);
+    else if (strncmp(msg, "delete", 6) == 0) {
+        handle_delete(msg, frame_num);
     } 
     else {
-        fprintf(stderr, "Invalid request: %s\n", cmd_start);
+        fprintf(stderr, "Invalid request: %s\n", msg);
         ack_sender("Invalid command", "ACK:INVALID", frame_num);
     }
 
