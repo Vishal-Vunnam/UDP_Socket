@@ -13,7 +13,7 @@
 #define BUFSIZE 1024
 #define SWS 4
 #define ARRAY_SIZE 10
-#define ACK_TIMEOUT 10
+#define ACK_TIMEOUT 3
 
 
 void error(char *msg) { 
@@ -294,14 +294,17 @@ int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window) {
 
 }
 
+
+
 void handle_timeout(SWS_info *sender_window, int sockfd, struct sockaddr_in serveraddr, int serverlen) {
     // placeholder to compile cleanly
     // (void)sender_window;
     // (void)sockfd;
     // (void)serveraddr;
     // (void)serverlen;
-    for (int i = sender_window->LAR; i != sender_window->LFS; i = (i + 1) & ARRAY_SIZE) { 
+    for (int i = sender_window->LAR + 1; i != (sender_window->LFS + 1) % ARRAY_SIZE; i = (i + 1) & ARRAY_SIZE) { 
         printf("Resending frame %d\n", i);
+        printf("RESENDING MESSAGE: %s\n", sender_window->sendQ[i].msg);
         sender_window->sendQ[i].send_time = time(NULL);
         int n = sendto(
             sockfd, 
