@@ -202,8 +202,8 @@ void handle_get(char *buf, int frame_num) {
     
     // Set flag and prepare to send
     server_sending = true;
-    // init_server_SWS(&server_sender_window, BUFSIZE);
-    // server_sender_window.LAR = frame_num;  // Start from current frame
+    init_server_SWS(&server_sender_window, BUFSIZE);
+    server_sender_window.LAR = frame_num;  // Start from current frame
     
     // Start sending file chunks
     server_send_file_chunk(&server_sender_window, buf, frame_num);
@@ -554,13 +554,17 @@ int main(int argc, char ** argv) {
         // ✅ CHECK TIMEOUT when server is sending
         if (server_sending && server_sender_window.LFS > server_sender_window.LAR) {
             int oldest_unacked = (server_sender_window.LAR + 1) % ARRAY_SIZE;
-            if (!server_sender_window.sendQ[oldest_unacked].acked &&
-                server_sender_window.sendQ[oldest_unacked].send_time != 0 &&
+            if (server_sender_window.sendQ[oldest_unacked].send_time != 0 &&
                 difftime(time(NULL), server_sender_window.sendQ[oldest_unacked].send_time) >= 3)
             {
                 printf("Server: ACK timeout for frame %d, resending...\n", oldest_unacked);
                 server_handle_timeout(&server_sender_window);
             }
+        }
+
+        if(server_sending) { 
+            // Continue sending file chunks if window allows
+            server_send_file_chunk(&server_sender_window, server_filename, -1);
         }
         
         // ✅ Setup select() instead of blocking recvfrom()
