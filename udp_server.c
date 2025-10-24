@@ -202,8 +202,8 @@ void handle_get(char *buf, int frame_num) {
     
     // Set flag and prepare to send
     server_sending = true;
-    init_server_SWS(&server_sender_window, BUFSIZE);
-    server_sender_window.LAR = frame_num;  // Start from current frame
+    // init_server_SWS(&server_sender_window, BUFSIZE);
+    // server_sender_window.LAR = frame_num;  // Start from current frame
     
     // Start sending file chunks
     server_send_file_chunk(&server_sender_window, buf, frame_num);
@@ -533,6 +533,7 @@ int main(int argc, char ** argv) {
 
     RWS_info receiver_window;
     init_RWS(&receiver_window, BUFSIZE);
+    init_server_SWS(&server_sender_window, BUFSIZE);
 
     printf("Server listening on port %d\n", portno);
     clientlen = sizeof(clientaddr);

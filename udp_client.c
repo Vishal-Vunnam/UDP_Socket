@@ -334,7 +334,7 @@ int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window, RWS_info
         }
     }
     else { 
-        if (check_rec_ack_num(acknum, receiver_window) < 0) { 
+        if (check_rec_ack_num(acknum, receiver_window) != 0) { 
             return -1; 
         }
     }
