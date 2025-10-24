@@ -374,10 +374,18 @@ int server_check_ack(int ack_num, SWS_info *sender_window) {
         printf("Server: ACK received for frame %d\n", ack_num);
 
         // Slide window forward
-        while (sender_window->sendQ[(sender_window->LAR + 1) % ARRAY_SIZE].acked && 
-               sender_window->LAR != sender_window->LFS) {
-            sender_window->LAR = (sender_window->LAR + 1) % ARRAY_SIZE;
-            printf("Server window sliding: LAR now %d\n", sender_window->LAR);
+        // while (sender_window->sendQ[(sender_window->LAR + 1) % ARRAY_SIZE].acked && 
+        //        sender_window->LAR != sender_window->LFS) {
+        //     sender_window->LAR = (sender_window->LAR + 1) % ARRAY_SIZE;
+        //     printf("Server window sliding: LAR now %d\n", sender_window->LAR);
+        // }
+
+        if (ack_num == (sender_window->LAR + 1) % ARRAY_SIZE) {
+            sender_window->LAR = ack_num; 
+        }
+        else { 
+            printf("Server: ACK %d received out of order, LAR=%d\n", ack_num, sender_window->LAR);
+            return -1; 
         }
 
         return 0; 
