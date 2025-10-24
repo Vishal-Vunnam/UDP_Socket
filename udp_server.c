@@ -61,7 +61,11 @@ client_info global_client_info;
 // Global file pointer for reading file data
 FILE *global_read_fp = NULL;
 
-
+static inline int seq_distance(int a, int b) {
+    // distance of a relative to b in modulo ARRAY_SIZE space.
+    // both a and b should be in [0, ARRAY_SIZE-1] or -1 initial is handled outside.
+    return ( (a - b) + ARRAY_SIZE ) % ARRAY_SIZE;
+}
 
 
 void error(const char * msg) { 
@@ -203,7 +207,7 @@ void handle_get(char *buf, int frame_num) {
     // Set flag and prepare to send
     server_sending = true;
     init_server_SWS(&server_sender_window, BUFSIZE);
-    server_sender_window.LAR = frame_num;  // Start from current frame
+    // server_sender_window.LFS = 0;  // Start from current frame
     
     // Start sending file chunks
     server_send_file_chunk(&server_sender_window, buf, frame_num);
@@ -258,7 +262,9 @@ int server_send_file_chunk(SWS_info *sender_window, const char *filename, int cu
     }
 
     // Send up to window size
-    while(sender_window->LFS - sender_window->LAR < SWS) {
+    printf(seq_distance(sender_window->LFS, sender_window->LAR) < SWS ? "Server window has space to send.\n" : "Server window full, cannot send more.\n");
+    printf("Server Window State: LAR=%d, LFS=%d\n", sender_window->LAR, sender_window->LFS);    
+    while(seq_distance(sender_window->LFS, sender_window->LAR) < SWS || sender_window->LAR == -1) {
         char file_buf[BUFSIZE - 128];
         size_t bytes_read = fread(file_buf, 1, sizeof(file_buf), server_read_fp); 
         
@@ -562,10 +568,6 @@ int main(int argc, char ** argv) {
             }
         }
 
-        if(server_sending) { 
-            // Continue sending file chunks if window allows
-            server_send_file_chunk(&server_sender_window, server_filename, -1);
-        }
         
         // ✅ Setup select() instead of blocking recvfrom()
         FD_ZERO(&readfds);
@@ -607,5 +609,10 @@ int main(int argc, char ** argv) {
         } else {
             perror("select error");
         }
+
+        if (server_sending && server_filename != NULL) { 
+            server_send_file_chunk(&server_sender_window, server_filename, -1);
+        }
+
     }
 }

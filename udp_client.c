@@ -331,6 +331,8 @@ int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window, RWS_info
     // Only check ACK if client is currently sending (PUT operation)
     // else if (acknum != )
 
+
+
     if (!client_receiving) {
         if (check_ack_num(acknum, sender_window) < 0) { 
             return -1; 
