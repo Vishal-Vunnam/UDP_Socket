@@ -328,16 +328,6 @@ int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window, RWS_info
     printf("Received ACK for frame %d\n", acknum);
     
     // Only check ACK if client is currently sending (PUT operation)
-    if (!client_receiving) {
-        if (check_ack_num(acknum, sender_window) < 0) { 
-            return -1; 
-        }
-    }
-    else { 
-        if (check_rec_ack_num(acknum, receiver_window) != 0) { 
-            return -1; 
-        }
-    }
     // else if (acknum != )
 
     // move pointer to payload after first '|'
@@ -349,6 +339,17 @@ int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window, RWS_info
         // Start receiving file data
         client_receiving = true;
         printf("Starting to receive file data from server.\n");
+    }
+
+    if (!client_receiving) {
+        if (check_ack_num(acknum, sender_window) < 0) { 
+            return -1; 
+        }
+    }
+    else { 
+        if (check_rec_ack_num(acknum, receiver_window) != 0) { 
+            return -1; 
+        }
     }
 
 
