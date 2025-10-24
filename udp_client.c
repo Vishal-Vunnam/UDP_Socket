@@ -283,36 +283,37 @@ int check_ack_num(int ack_num, SWS_info *sender_window) {
         }
     }
 }
-
 int check_rec_ack_num(int ack_num, RWS_info *receiver_window) { 
     if (ack_num < 0 || ack_num >= ARRAY_SIZE) {
         fprintf(stderr, "Invalid received frame number: %d\n", ack_num);
         return -1; 
     }
-    printf("Checking received frame number: %d\n", ack_num);
-    if(ack_num == (receiver_window->LFR + 1) % ARRAY_SIZE) { 
+    
+    printf("Client checking received frame: %d (LFR=%d)\n", ack_num, receiver_window->LFR);
+    
+    if (ack_num == (receiver_window->LFR + 1) % ARRAY_SIZE) { 
+        // Expected frame - accept it
         receiver_window->LFR = (receiver_window->LFR + 1) % ARRAY_SIZE; 
         return 0; 
     }
-    else if (ack_num >= (receiver_window->LFR + 1 - RWS) % ARRAY_SIZE && ack_num <= (receiver_window->LFR) % ARRAY_SIZE) { 
-        printf("Duplicate frame received: %d\n", ack_num);
+    else if (ack_num <= receiver_window->LFR) { 
+        // Duplicate frame (already received)
+        printf("Duplicate frame received: %d (already have up to %d)\n", ack_num, receiver_window->LFR);
+        
+        // Send ACK for duplicate
         char ack_response[BUFSIZE];
-        snprintf(ack_response, sizeof(ack_response), "%d | ACK | received", ack_num);
-        int n = sendto(global_server_info.sockfd, ack_response, strlen(ack_response), 0,
-                        (struct sockaddr *)&global_server_info.serveraddr, 
-                        global_server_info.serverlen);
-        if (n < 0) {
-            perror("Failed to send ACK to server");
-        }
-        return 1; 
+        snprintf(ack_response, sizeof(ack_response), "%d | ACK | duplicate", ack_num);
+        sendto(global_server_info.sockfd, ack_response, strlen(ack_response), 0,
+               (struct sockaddr *)&global_server_info.serveraddr, 
+               global_server_info.serverlen);
+        return 1;  // Duplicate, don't process
     }
     else {
-
-        printf("Out of order frame received for frame %d expected %d\n", ack_num, (receiver_window->LFR + 1) % ARRAY_SIZE);
-        return -1; 
+        // Out of order (gap in sequence)
+        printf("Out of order frame: %d, expected %d\n", ack_num, (receiver_window->LFR + 1) % ARRAY_SIZE);
+        return -1;  // Drop it
     }
 }
-
 int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window, RWS_info *receiver_window) { 
     int acknum = -1; 
     char *sep = strstr(buf, "|");
@@ -330,6 +331,17 @@ int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window, RWS_info
     // Only check ACK if client is currently sending (PUT operation)
     // else if (acknum != )
 
+    if (!client_receiving) {
+        if (check_ack_num(acknum, sender_window) < 0) { 
+            return -1; 
+        }
+    }
+    else { 
+        if (check_rec_ack_num(acknum, receiver_window) != 0) { 
+            return -1; 
+        }
+    }
+
     // move pointer to payload after first '|'
     char *payload = sep + 1;
     // ✅ Skip only single space after '|' if present
@@ -341,16 +353,6 @@ int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window, RWS_info
         printf("Starting to receive file data from server.\n");
     }
 
-    if (!client_receiving) {
-        if (check_ack_num(acknum, sender_window) < 0) { 
-            return -1; 
-        }
-    }
-    else { 
-        if (check_rec_ack_num(acknum, receiver_window) != 0) { 
-            return -1; 
-        }
-    }
 
 
     // If there's an ACK/type field (e.g. "ACK:GET | ..."), skip it and the next '|'
