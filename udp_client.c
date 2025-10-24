@@ -13,6 +13,7 @@
 
 #define BUFSIZE 1024
 #define SWS 4
+#define RWS 4
 #define ARRAY_SIZE 10
 #define ACK_TIMEOUT 3
 
@@ -36,6 +37,16 @@ typedef struct {
    } sendQ[ARRAY_SIZE];
 } SWS_info; 
 
+typedef struct {    
+    int LFR; 
+    int LAF; 
+    int frame_size; 
+    struct recQ_slot { 
+        int received; 
+        char msg[BUFSIZE];
+    } recQ[ARRAY_SIZE];
+} RWS_info;
+
 FILE *client_write_fp = NULL;
 char *client_write_filename = NULL;
 bool client_receiving = false;
@@ -55,7 +66,7 @@ int handle_user_input(char *buf, int buf_len, SWS_info *sender_window);
 int send_next_file_chunk(SWS_info *sender_window, const char *filename);
 int send_frame(char *s_msg, char *msg_type, int msg_len, SWS_info *sender_window);
 int check_ack_num(int ack_num, SWS_info *sender_window);
-int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window);
+int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window, RWS_info *receiver_window);
 void handle_timeout(SWS_info *sender_window, int sockfd, struct sockaddr_in serveraddr, int serverlen);
 
 // Global server response info
@@ -82,6 +93,16 @@ void init_SWS(SWS_info *sender_window, int frame_size) {
   }
 }
 
+
+void init_RWS(RWS_info *receiver_window, int frame_size) { 
+    receiver_window->LFR = -1; 
+    receiver_window->LAF = -1;
+    receiver_window->frame_size = frame_size; 
+    for (int i = 0; i < ARRAY_SIZE; i++) { 
+        receiver_window->recQ[i].received = 0; 
+        memset(receiver_window->recQ[i].msg, 0, BUFSIZE);
+    } 
+}
 // Command to reset select timeout
 void reset_timeout(struct timeval *timeout) { 
   timeout->tv_sec = 1; 
@@ -263,7 +284,36 @@ int check_ack_num(int ack_num, SWS_info *sender_window) {
     }
 }
 
-int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window) { 
+int check_rec_ack_num(int ack_num, RWS_info *receiver_window) { 
+    if (ack_num < 0 || ack_num >= ARRAY_SIZE) {
+        fprintf(stderr, "Invalid received frame number: %d\n", ack_num);
+        return -1; 
+    }
+    printf("Checking received frame number: %d\n", ack_num);
+    if(ack_num == (receiver_window->LFR + 1) % ARRAY_SIZE) { 
+        receiver_window->LFR = (receiver_window->LFR + 1) % ARRAY_SIZE; 
+        return 0; 
+    }
+    else if (ack_num >= (receiver_window->LFR + 1 - RWS) % ARRAY_SIZE && ack_num <= (receiver_window->LFR) % ARRAY_SIZE) { 
+        printf("Duplicate frame received: %d\n", ack_num);
+        char ack_response[BUFSIZE];
+        snprintf(ack_response, sizeof(ack_response), "%d | ACK | received", ack_num);
+        int n = sendto(global_server_info.sockfd, ack_response, strlen(ack_response), 0,
+                        (struct sockaddr *)&global_server_info.serveraddr, 
+                        global_server_info.serverlen);
+        if (n < 0) {
+            perror("Failed to send ACK to server");
+        }
+        return 1; 
+    }
+    else {
+
+        printf("Out of order frame received for frame %d expected %d\n", ack_num, (receiver_window->LFR + 1) % ARRAY_SIZE);
+        return -1; 
+    }
+}
+
+int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window, RWS_info *receiver_window) { 
     int acknum = -1; 
     char *sep = strstr(buf, "|");
     if (sep == NULL) {
@@ -283,6 +333,12 @@ int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window) {
             return -1; 
         }
     }
+    else { 
+        if (check_rec_ack_num(acknum, receiver_window) < 0) { 
+            return -1; 
+        }
+    }
+    // else if (acknum != )
 
     // move pointer to payload after first '|'
     char *payload = sep + 1;
@@ -470,6 +526,7 @@ int main(int argc, char **argv) {
     struct hostent *server;
     char *hostname;
     SWS_info sender_window; 
+    RWS_info receiver_window;
     char buf[BUFSIZE];
 
     if (argc != 3) {
@@ -502,6 +559,7 @@ int main(int argc, char **argv) {
     global_server_info.serverlen = serverlen;
 
     init_SWS(&sender_window, BUFSIZE);
+    init_RWS(&receiver_window, BUFSIZE);
 
     fd_set readfds;
     FD_ZERO(&readfds);
@@ -539,7 +597,7 @@ int main(int argc, char **argv) {
                 printf("------------------------ \n");
                 printf("ECHO FROM SERVER: %s\n", buf); 
                 printf("------------------------ \n");
-                sender_ack_handler(buf, n, &sender_window); 
+                sender_ack_handler(buf, n, &sender_window, &receiver_window); 
                 memset(buf, 0, BUFSIZE);
             }
             if (FD_ISSET(STDIN_FILENO, &readfds)) { 
