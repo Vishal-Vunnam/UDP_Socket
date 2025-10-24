@@ -265,10 +265,12 @@ int server_send_file_chunk(SWS_info *sender_window, const char *filename, int cu
     printf(seq_distance(sender_window->LFS, sender_window->LAR) < SWS ? "Server window has space to send.\n" : "Server window full, cannot send more.\n");
     printf("Server Window State: LAR=%d, LFS=%d\n", sender_window->LAR, sender_window->LFS);    
     while(seq_distance(sender_window->LFS, sender_window->LAR) < SWS || sender_window->LAR == -1) {
+        
         char file_buf[BUFSIZE - 128];
         size_t bytes_read = fread(file_buf, 1, sizeof(file_buf), server_read_fp); 
         
         if (bytes_read > 0) { 
+
             char msg[BUFSIZE];
             // ✅ FIX: Use sender_window->LFS, not current_frame
             int seq_num = (sender_window->LFS + 1) % ARRAY_SIZE;
@@ -277,12 +279,6 @@ int server_send_file_chunk(SWS_info *sender_window, const char *filename, int cu
             
             memcpy(msg + header_len, file_buf, bytes_read);
             int total_len = header_len + bytes_read;
-
-            if (sender_window->LFS - sender_window->LAR >= SWS) { 
-                printf("Server window full, cannot send frame %d now.\n", seq_num);
-                return 0; 
-            }
-
             int n = sendto(global_client_info.sockfd, msg, total_len, 0, 
                           (struct sockaddr *)&global_client_info.clientaddr, 
                           global_client_info.clientlen);
