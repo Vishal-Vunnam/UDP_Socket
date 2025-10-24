@@ -330,6 +330,37 @@ int server_send_file_chunk(SWS_info *sender_window, const char *filename, int cu
     return 0;
 }
 
+#define ACK_TIMEOUT 3
+
+void server_handle_timeout(SWS_info *sender_window) {
+    printf("=== SERVER TIMEOUT: Resending all unacked frames ===\n");
+    printf("Server Window: LAR=%d, LFS=%d\n", sender_window->LAR, sender_window->LFS);
+    
+    for (int i = (sender_window->LAR + 1) % ARRAY_SIZE; 
+         i != (sender_window->LFS + 1) % ARRAY_SIZE; 
+         i = (i + 1) % ARRAY_SIZE) { 
+        
+        if (!sender_window->sendQ[i].acked) {
+            printf("Server resending frame %d (length: %d)\n", i, sender_window->sendQ[i].msg_len);
+            
+            int n = sendto(global_client_info.sockfd, 
+                          sender_window->sendQ[i].msg, 
+                          sender_window->sendQ[i].msg_len,
+                          0, 
+                          (struct sockaddr *)&global_client_info.clientaddr, 
+                          global_client_info.clientlen);
+            if (n < 0) {
+                perror("ERROR: Server resending frame");
+            } else {
+                sender_window->sendQ[i].send_time = time(NULL);
+            }
+        }
+        
+        // Stop when we've checked LFS
+        if (i == sender_window->LFS) break;
+    }
+}
+
 int server_check_ack(int ack_num, SWS_info *sender_window) {
     if (ack_num < 0 || ack_num >= ARRAY_SIZE) {
         fprintf(stderr, "Server: Invalid ACK number: %d\n", ack_num);
@@ -505,31 +536,63 @@ int main(int argc, char ** argv) {
 
     printf("Server listening on port %d\n", portno);
     clientlen = sizeof(clientaddr);
+    
+    // ✅ ADD: File descriptor set and timeout for select()
+    fd_set readfds;
+    struct timeval tv;
+    
     while (1) {
-        bzero(buf, BUFSIZE);
-        n = recvfrom(sockfd, buf, BUFSIZE, 0,
-                        (struct sockaddr *) &clientaddr, (socklen_t *) &clientlen);
+        // ✅ CHECK TIMEOUT when server is sending
+        if (server_sending && server_sender_window.LFS > server_sender_window.LAR) {
+            int oldest_unacked = (server_sender_window.LAR + 1) % ARRAY_SIZE;
+            if (!server_sender_window.sendQ[oldest_unacked].acked &&
+                server_sender_window.sendQ[oldest_unacked].send_time != 0 &&
+                difftime(time(NULL), server_sender_window.sendQ[oldest_unacked].send_time) >= 3)
+            {
+                printf("Server: ACK timeout for frame %d, resending...\n", oldest_unacked);
+                server_handle_timeout(&server_sender_window);
+            }
+        }
         
-        if (n < 0) error("ERROR in recvfrom");
+        // ✅ Setup select() instead of blocking recvfrom()
+        FD_ZERO(&readfds);
+        FD_SET(sockfd, &readfds);
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        
+        int rv = select(sockfd + 1, &readfds, NULL, NULL, &tv);
+        
+        if (rv > 0 && FD_ISSET(sockfd, &readfds)) {
+            // Data available
+            bzero(buf, BUFSIZE);
+            n = recvfrom(sockfd, buf, BUFSIZE, 0,
+                            (struct sockaddr *) &clientaddr, (socklen_t *) &clientlen);
+            
+            if (n < 0) error("ERROR in recvfrom");
 
-        hostp = gethostbyaddr((const char *)&clientaddr.sin_addr.s_addr, 
-                              sizeof(clientaddr.sin_addr.s_addr), AF_INET);
+            hostp = gethostbyaddr((const char *)&clientaddr.sin_addr.s_addr, 
+                                  sizeof(clientaddr.sin_addr.s_addr), AF_INET);
 
-        if (hostp == NULL)
-            error("ERROR on gethostbyaddr");
-        hostaddrp = inet_ntoa(clientaddr.sin_addr);
-        if (hostaddrp == NULL)
-            error("ERROR on inet_ntoa");
+            if (hostp == NULL)
+                error("ERROR on gethostbyaddr");
+            hostaddrp = inet_ntoa(clientaddr.sin_addr);
+            if (hostaddrp == NULL)
+                error("ERROR on inet_ntoa");
 
-        printf("server received datagram from %s:%d\n", 
-               hostaddrp, ntohs(clientaddr.sin_port));
+            printf("server received datagram from %s:%d\n", 
+                   hostaddrp, ntohs(clientaddr.sin_port));
 
-        global_client_info.sockfd = sockfd;
-        global_client_info.clientaddr = clientaddr;
-        global_client_info.clientlen = clientlen;
+            global_client_info.sockfd = sockfd;
+            global_client_info.clientaddr = clientaddr;
+            global_client_info.clientlen = clientlen;
 
-        if (n > 0) { 
-            client_input_handler(buf, n, &receiver_window); 
+            if (n > 0) { 
+                client_input_handler(buf, n, &receiver_window); 
+            }
+        } else if (rv == 0) {
+            // Timeout - just continue loop to check for retransmission needs
+        } else {
+            perror("select error");
         }
     }
 }
