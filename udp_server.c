@@ -10,9 +10,12 @@
 #include <dirent.h> // for handle_ls
 #include <ctype.h>
 #include <errno.h>
+#include <stdbool.h>
+#include <time.h> 
 
 #define BUFSIZE 1024
 #define RWS 4
+#define SWS 4
 #define ARRAY_SIZE 10
 
 typedef struct { 
@@ -30,6 +33,26 @@ typedef struct {
         char msg[BUFSIZE];
     } recQ[ARRAY_SIZE];
 } RWS_info;
+
+typedef struct {
+   int LAR; 
+   int LFS; 
+   int frame_ptr; 
+   int frame_size;  
+   struct sendQ_slot {
+      char msg[BUFSIZE]; 
+      int msg_len; 
+      int acked; 
+      time_t send_time; 
+   } sendQ[ARRAY_SIZE];
+} SWS_info; 
+
+int server_send_file_chunk(SWS_info *sender_window, const char *filename, int current_frame);
+
+bool server_sending = false;
+SWS_info server_sender_window;  
+char *server_filename = NULL;
+FILE *server_read_fp = NULL;
 
 
 // Global client address info 
@@ -54,6 +77,17 @@ void init_RWS(RWS_info *receiver_window, int frame_size) {
         receiver_window->recQ[i].received = 0; 
         memset(receiver_window->recQ[i].msg, 0, BUFSIZE);
     } 
+}
+
+void init_server_SWS(SWS_info *sender_window, int frame_size) { 
+  sender_window->LAR = -1; 
+  sender_window->LFS = -1; 
+  sender_window->frame_size = frame_size; 
+  for (int i = 0; i < ARRAY_SIZE; i++) { 
+    sender_window->sendQ[i].acked = 1; 
+    memset(sender_window->sendQ[i].msg, 0, BUFSIZE);
+    sender_window->sendQ[i].msg_len = 0;
+  }
 }
 
 void ack_sender(char *msg, char *ACK_type, int acknum) { 
@@ -157,16 +191,22 @@ void handle_put(char *buf, int frame_num) {
 void handle_get(char *buf, int frame_num) { 
     if (buf == NULL) return;
     buf += 4; 
+    buf[strcspn(buf, "\r\n ")] = '\0'; 
 
-    buf[strcspn(buf, "\r\n")] = '\0'; 
+    // ack_sender("Preparing to send file.", "ACK:GET_PREPARE", frame_num);
 
     printf("Requested to get file: %s\n", buf); 
 
-    char response[BUFSIZE]; 
-    snprintf(response, sizeof(response), "putfile:%s", buf); 
-    ack_sender(response, "ACK:GET", frame_num);
-
-    (void)buf; 
+    // ACK the command
+    ack_sender("Starting file transfer", "ACK:GET", frame_num);
+    
+    // Set flag and prepare to send
+    server_sending = true;
+    init_server_SWS(&server_sender_window, BUFSIZE);
+    server_sender_window.LAR = frame_num;  // Start from current frame
+    
+    // Start sending file chunks
+    server_send_file_chunk(&server_sender_window, buf, frame_num);
 }
 
 
@@ -205,6 +245,115 @@ void put_helper(char *filename, char *data_buf, int data_len, int frame_num){
     snprintf(gimme_buf, sizeof(gimme_buf), "gotfile:%s", filename);
 
     ack_sender(gimme_buf, "ACK:PUT_Confirm", frame_num);
+}
+
+int server_send_file_chunk(SWS_info *sender_window, const char *filename, int current_frame) {
+    if (!server_read_fp) { 
+        server_read_fp = fopen(filename, "rb"); 
+        server_filename = strdup(filename);
+        if (!server_read_fp) { 
+            perror("fopen");
+            return -1; 
+        }
+    }
+
+    // Send up to window size
+    while(sender_window->LFS - sender_window->LAR < SWS) {
+        char file_buf[BUFSIZE - 128];
+        size_t bytes_read = fread(file_buf, 1, sizeof(file_buf), server_read_fp); 
+        
+        if (bytes_read > 0) { 
+            char msg[BUFSIZE];
+            // ✅ FIX: Use sender_window->LFS, not current_frame
+            int seq_num = (sender_window->LFS + 1) % ARRAY_SIZE;
+            int header_len = snprintf(msg, sizeof(msg), "%d | getfile:%s | ", 
+                                     seq_num, filename);
+            
+            memcpy(msg + header_len, file_buf, bytes_read);
+            int total_len = header_len + bytes_read;
+
+            if (sender_window->LFS - sender_window->LAR >= SWS) { 
+                printf("Server window full, cannot send frame %d now.\n", seq_num);
+                return 0; 
+            }
+
+            int n = sendto(global_client_info.sockfd, msg, total_len, 0, 
+                          (struct sockaddr *)&global_client_info.clientaddr, 
+                          global_client_info.clientlen);
+            
+            if (n < 0) {
+                perror("ERROR sending file chunk from server");
+                return -1; 
+            }
+
+            printf("Server sent frame %d with %zu bytes\n", seq_num, bytes_read);
+            
+            // Update server's sending window
+            sender_window->LFS = seq_num;
+            sender_window->sendQ[seq_num].acked = 0;
+            sender_window->sendQ[seq_num].send_time = time(NULL);
+            memcpy(sender_window->sendQ[seq_num].msg, msg, total_len);
+            sender_window->sendQ[seq_num].msg_len = total_len;
+
+        } else {
+            if (feof(server_read_fp)) {
+                printf("Server finished sending file: %s\n", filename);
+            } else {
+                perror("fread");
+            }
+            
+            // Send EOF marker
+            int seq_num = (sender_window->LFS + 1) % ARRAY_SIZE;
+            char msg[BUFSIZE];
+            int msg_len = snprintf(msg, sizeof(msg), "%d | getfile_end | EOF", seq_num);
+            
+            sendto(global_client_info.sockfd, msg, msg_len, 0,
+                  (struct sockaddr *)&global_client_info.clientaddr, 
+                  global_client_info.clientlen);
+            
+            // ✅ Update window for EOF frame too
+            sender_window->LFS = seq_num;
+            sender_window->sendQ[seq_num].acked = 0;
+            sender_window->sendQ[seq_num].send_time = time(NULL);
+            memcpy(sender_window->sendQ[seq_num].msg, msg, msg_len);
+            sender_window->sendQ[seq_num].msg_len = msg_len;
+            
+            fclose(server_read_fp);
+            free(server_filename);
+            server_read_fp = NULL;
+            server_filename = NULL;
+            // ✅ Don't set server_sending = false yet, wait for EOF ACK
+            
+            return 0; 
+        }
+    }
+    return 0;
+}
+
+int server_check_ack(int ack_num, SWS_info *sender_window) {
+    if (ack_num < 0 || ack_num >= ARRAY_SIZE) {
+        fprintf(stderr, "Server: Invalid ACK number: %d\n", ack_num);
+        return -1; 
+    }
+    
+    printf("Server checking ACK: %d\n", ack_num);
+    
+    // if (!sender_window->sendQ[ack_num].acked) { 
+        sender_window->sendQ[ack_num].acked = 1; 
+        printf("Server: ACK received for frame %d\n", ack_num);
+
+        // Slide window forward
+        while (sender_window->sendQ[(sender_window->LAR + 1) % ARRAY_SIZE].acked && 
+               sender_window->LAR != sender_window->LFS) {
+            sender_window->LAR = (sender_window->LAR + 1) % ARRAY_SIZE;
+            printf("Server window sliding: LAR now %d\n", sender_window->LAR);
+        }
+
+        return 0; 
+    // } else {
+    //     printf("Server: Duplicate ACK for frame %d\n", ack_num);
+    //     return 0;  // Not an error
+    // }
 }
 
 
@@ -257,8 +406,10 @@ int client_input_handler(char *buf, int buf_len, RWS_info *receiver_window) {
     printf("Data length: %d bytes\n", data_len);
 
     // Check if frame number is expected
-    if (handle_frame_num(frame_num, receiver_window) < 0) { 
-        return -1; 
+    if(!server_sending){
+        if (handle_frame_num(frame_num, receiver_window) < 0) { 
+            return -1; 
+        }
     }
 
     // Handle binary file data
@@ -271,6 +422,23 @@ int client_input_handler(char *buf, int buf_len, RWS_info *receiver_window) {
         printf("Finished receiving file data for frame %d\n", frame_num);
         ack_sender("File transfer complete.", "ACK:PUT_END", frame_num);
         return frame_num;
+    }
+
+    if (server_sending) {
+        // Check if this is an ACK message
+        if (strncmp(ack_type, "ACK", 3) == 0) {
+            // Client ACKed our data frame
+            if (server_check_ack(frame_num, &server_sender_window) == 0) {
+                // Continue sending if file still open
+                if (server_read_fp) {
+                    server_send_file_chunk(&server_sender_window, server_filename, frame_num);
+                }
+                if (strncmp(msg, "complete", 8) == 0) { 
+                    server_sending = false;
+                }
+            }
+            return frame_num;
+        }
     }
 
     // For text commands, NOW we can strip whitespace

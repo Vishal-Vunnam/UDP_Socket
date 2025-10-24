@@ -1,6 +1,7 @@
 {
     "files.associations": {
-        "in.h": "c"
+        "in.h": "c",
+        "time.h": "c"
     },
     "github.copilot.nextEditSuggestions.enabled": true
 }

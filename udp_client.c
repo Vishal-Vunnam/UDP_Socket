@@ -9,6 +9,7 @@
 #include <time.h>
 #include <ctype.h>
 #include <errno.h>
+#include <stdbool.h>
 
 #define BUFSIZE 1024
 #define SWS 4
@@ -35,11 +36,17 @@ typedef struct {
    } sendQ[ARRAY_SIZE];
 } SWS_info; 
 
+FILE *client_write_fp = NULL;
+char *client_write_filename = NULL;
+bool client_receiving = false;
+bool client_sending = true;
+
 typedef struct { 
     int sockfd; 
     struct sockaddr_in serveraddr; 
     int serverlen; 
 } server_res_info; 
+
 
 void init_SWS(SWS_info *sender_window, int frame_size);
 void reset_timeout(struct timeval *timeout);
@@ -140,6 +147,10 @@ int handle_user_input(char *buf, int buf_len, SWS_info *sender_window) {
         return -1;
     }
 
+    // // ✅ Set flag if it's a PUT command
+    // if (strncmp(buf, "put ", 4) == 0 }}) {
+    //     client_sending = true;
+    // }
 
     int n = send_frame(buf, "COMMAND", buf_len, sender_window); 
     if (n < 0) {
@@ -265,8 +276,12 @@ int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window) {
         return -1;
     }   
     printf("Received ACK for frame %d\n", acknum);
-    if (check_ack_num(acknum, sender_window) < 0) { 
-        return -1; 
+    
+    // Only check ACK if client is currently sending (PUT operation)
+    if (!client_receiving) {
+        if (check_ack_num(acknum, sender_window) < 0) { 
+            return -1; 
+        }
     }
 
     // move pointer to payload after first '|'
@@ -274,20 +289,126 @@ int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window) {
     // ✅ Skip only single space after '|' if present
     if (*payload == ' ') payload++;
 
-    // If there's an ACK/type field (e.g. "ACK | gimmefile:..."), skip it and the next '|'
+    if(strncmp(payload, "ACK:GET" , 7) == 0) {
+        // Start receiving file data
+        client_receiving = true;
+        printf("Starting to receive file data from server.\n");
+    }
+
+
+    // If there's an ACK/type field (e.g. "ACK:GET | ..."), skip it and the next '|'
+    char *ack_type_start = payload;
     if (strncmp(payload, "ACK", 3) == 0) {
         char *p = strchr(payload, '|');
         if (p) {
             payload = p + 1;
             if (*payload == ' ') payload++;  // ✅ Skip single space only
+            ack_type_start = payload;
         }
     }
 
+
+    // ===== HANDLE GET FILE DATA FROM SERVER =====
+    if (strncmp(ack_type_start, "getfile:", 8) == 0) {
+        client_receiving = true;
+        
+        // Extract filename from "getfile:filename"
+        char filename[256];
+        char *fname_start = ack_type_start + 8;
+        
+        // Find where filename ends (at the next '|' or space)
+        char *fname_end = strchr(fname_start, '|');
+        if (fname_end) {
+            int fname_len = fname_end - fname_start;
+            if (fname_len > 0 && fname_len < 256) {
+                strncpy(filename, fname_start, fname_len);
+                filename[fname_len] = '\0';
+                
+                // Trim any trailing spaces
+                char *trim = filename + strlen(filename) - 1;
+                while (trim > filename && isspace((unsigned char)*trim)) {
+                    *trim = '\0';
+                    trim--;
+                }
+            }
+            
+            // Find data after the '|'
+            char *data_start = fname_end + 1;
+            if (*data_start == ' ') data_start++;
+            
+            int data_len = buf_len - (data_start - buf);
+            
+            printf("Receiving file chunk for: %s (%d bytes)\n", filename, data_len);
+            
+            // Open file for writing if not already open
+            if (!client_write_fp || !client_write_filename || 
+                strcmp(client_write_filename, filename) != 0) {
+                
+                if (client_write_fp) {
+                    fclose(client_write_fp);
+                    free(client_write_filename);
+                }
+                
+                client_write_fp = fopen(filename, "wb");
+                client_write_filename = strdup(filename);
+                
+                if (!client_write_fp) {
+                    perror("Failed to open file for writing");
+                    return -1;
+                }
+            }
+            
+            // Write data to file
+            if (client_write_fp && data_len > 0) {
+                size_t written = fwrite(data_start, 1, data_len, client_write_fp);
+                printf("Client wrote %zu bytes to %s\n", written, filename);
+            }
+            
+            // Send ACK back to server
+            char ack_response[BUFSIZE];
+            snprintf(ack_response, sizeof(ack_response), "%d | ACK | received", acknum);
+            int n = sendto(global_server_info.sockfd, ack_response, strlen(ack_response), 0,
+                          (struct sockaddr *)&global_server_info.serveraddr, 
+                          global_server_info.serverlen);
+            if (n < 0) {
+                perror("Failed to send ACK to server");
+            }
+        }
+        return 0;
+    }
+    
+    // ===== HANDLE GET FILE END =====
+    if (strncmp(ack_type_start, "getfile_end", 11) == 0) {
+        printf("File transfer complete!\n");
+        
+        if (client_write_fp) {
+            fclose(client_write_fp);
+            client_write_fp = NULL;
+        }
+        if (client_write_filename) {
+            free(client_write_filename);
+            client_write_filename = NULL;
+        }
+        
+        client_receiving = false;
+        
+        // Send final ACK
+        char ack_response[BUFSIZE];
+        snprintf(ack_response, sizeof(ack_response), "%d | ACK | complete", acknum);
+        sendto(global_server_info.sockfd, ack_response, strlen(ack_response), 0,
+               (struct sockaddr *)&global_server_info.serveraddr, 
+               global_server_info.serverlen);
+        
+        return 0;
+    }
+
+    // ===== HANDLE PUT OPERATION (EXISTING CODE) =====
     // Now strip whitespace ONLY for command parsing, not for binary data
     char *cmd = payload;
     while (isspace((unsigned char)*cmd)) cmd++;
 
     if (strncmp(cmd, "gimmefile:", 10) == 0) {
+        client_sending = true;
         char filename[256];
         char *fname = cmd + 10;
         // skip any leading colons and whitespace for filename parsing
@@ -302,12 +423,17 @@ int sender_ack_handler(char* buf, int buf_len, SWS_info *sender_window) {
         }
     }
 
+
     // IF READ FILE IS STILL OPEN, TRY TO SEND NEXT CHUNK
     if (global_read_fp) {
         if (send_next_file_chunk(sender_window, global_filename) < 0) {
             fprintf(stderr, "Failed to send next file chunk\n");
         }
+    } else {
+        // Done sending file
+        client_sending = false;
     }
+    
     return 0;
 }
 
