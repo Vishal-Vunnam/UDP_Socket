@@ -340,7 +340,7 @@ void server_handle_timeout(SWS_info *sender_window) {
          i != (sender_window->LFS + 1) % ARRAY_SIZE; 
          i = (i + 1) % ARRAY_SIZE) { 
         
-        if (!sender_window->sendQ[i].acked) {
+        // if (!sender_window->sendQ[i].acked) {
             printf("Server resending frame %d (length: %d)\n", i, sender_window->sendQ[i].msg_len);
             
             int n = sendto(global_client_info.sockfd, 
@@ -354,7 +354,7 @@ void server_handle_timeout(SWS_info *sender_window) {
             } else {
                 sender_window->sendQ[i].send_time = time(NULL);
             }
-        }
+        // }
         
         // Stop when we've checked LFS
         if (i == sender_window->LFS) break;
